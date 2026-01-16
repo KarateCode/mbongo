@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/charmbracelet/bubbles/spinner"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"go.mongodb.org/mongo-driver/bson"
@@ -104,6 +105,7 @@ type Focus int
 const (
 	FocusDatabases Focus = iota
 	FocusCollections
+	FocusQuery
 	FocusDocuments
 )
 
@@ -140,17 +142,34 @@ type Model struct {
 	flattenedTree   []*JSONNode // Flattened visible nodes for display
 	docCursor       int         // Cursor position in flattened tree
 	docScrollOffset int
+	// Query input
+	queryText    string        // The query text
+	queryCursor  int           // Cursor position within query text
+	querySpinner spinner.Model // Spinner for query loading
+	queryLoading bool          // Whether a query is in progress
+	queryFilter  bson.M        // Current active filter
+	// Error modal
+	errorModal   bool   // Whether to show error modal
+	errorMessage string // Error message to display
 }
 
 func initialModel() Model {
+	s := spinner.New()
+	s.Spinner = spinner.Dot
+	s.Style = lipgloss.NewStyle().Foreground(lipgloss.Color("205"))
+
 	return Model{
-		databases:   []string{},
-		collections: []string{},
-		documents:   []bson.M{},
-		dbCursor:    0,
-		collCursor:  0,
-		focus:       FocusDatabases,
-		loading:     true,
+		databases:    []string{},
+		collections:  []string{},
+		documents:    []bson.M{},
+		dbCursor:     0,
+		collCursor:   0,
+		queryText:    "{}",
+		queryCursor:  1, // Start between the braces
+		querySpinner: s,
+		queryFilter:  bson.M{},
+		focus:        FocusDatabases,
+		loading:      true,
 	}
 }
 
@@ -165,9 +184,14 @@ func (m Model) getDocPanelHeight() int {
 		availableHeight = 10
 	}
 	leftPanelTotalHeight := availableHeight / 2
-	rightPanelTotalHeight := leftPanelTotalHeight * 2
+	rightTotalHeight := leftPanelTotalHeight * 2
+
+	// Query panel takes 3 lines (1 inner + 2 border)
+	queryPanelTotalHeight := 3
+	docPanelTotalHeight := rightTotalHeight - queryPanelTotalHeight
+
 	// Inner height minus borders (2), minus header + blank line (2)
-	return rightPanelTotalHeight - 4
+	return docPanelTotalHeight - 4
 }
 
 // saveDocument saves the modified document back to MongoDB
@@ -273,6 +297,116 @@ func (m Model) openInEditor(docIndex int) tea.Cmd {
 	})
 }
 
+// relaxedJSONToStrict converts relaxed JavaScript-style JSON to strict JSON
+// Handles: unquoted keys, single-quoted strings
+func relaxedJSONToStrict(input string) string {
+	var result strings.Builder
+	i := 0
+	n := len(input)
+
+	for i < n {
+		ch := input[i]
+
+		switch {
+		case ch == '"':
+			// Already a double-quoted string, copy it as-is
+			result.WriteByte(ch)
+			i++
+			for i < n {
+				if input[i] == '\\' && i+1 < n {
+					result.WriteByte(input[i])
+					result.WriteByte(input[i+1])
+					i += 2
+				} else if input[i] == '"' {
+					result.WriteByte(input[i])
+					i++
+					break
+				} else {
+					result.WriteByte(input[i])
+					i++
+				}
+			}
+
+		case ch == '\'':
+			// Single-quoted string - convert to double quotes
+			result.WriteByte('"')
+			i++
+			for i < n {
+				if input[i] == '\\' && i+1 < n {
+					// Handle escape sequences
+					result.WriteByte(input[i])
+					result.WriteByte(input[i+1])
+					i += 2
+				} else if input[i] == '"' {
+					// Escape double quotes inside single-quoted strings
+					result.WriteString("\\\"")
+					i++
+				} else if input[i] == '\'' {
+					result.WriteByte('"')
+					i++
+					break
+				} else {
+					result.WriteByte(input[i])
+					i++
+				}
+			}
+
+		case ch == '{' || ch == ',' || ch == '[':
+			// After these, we might have an unquoted key (for objects)
+			result.WriteByte(ch)
+			i++
+			// Skip whitespace
+			for i < n && (input[i] == ' ' || input[i] == '\t' || input[i] == '\n' || input[i] == '\r') {
+				result.WriteByte(input[i])
+				i++
+			}
+			// Check if next is an unquoted identifier (potential key)
+			if i < n && ch != '[' && isIdentifierStart(input[i]) {
+				// Read the identifier
+				start := i
+				for i < n && isIdentifierChar(input[i]) {
+					i++
+				}
+				identifier := input[start:i]
+				// Skip whitespace after identifier
+				wsStart := i
+				for i < n && (input[i] == ' ' || input[i] == '\t' || input[i] == '\n' || input[i] == '\r') {
+					i++
+				}
+				// Check if followed by colon (making it a key)
+				if i < n && input[i] == ':' {
+					// It's a key - quote it
+					result.WriteByte('"')
+					result.WriteString(identifier)
+					result.WriteByte('"')
+					// Write the whitespace we skipped
+					result.WriteString(input[wsStart:i])
+				} else {
+					// Not a key - could be a value like true, false, null, or a number
+					result.WriteString(identifier)
+					result.WriteString(input[wsStart:i])
+				}
+			}
+
+		default:
+			result.WriteByte(ch)
+			i++
+		}
+	}
+
+	return result.String()
+}
+
+// isIdentifierStart returns true if ch can start a JavaScript identifier
+func isIdentifierStart(ch byte) bool {
+	return (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || ch == '_' || ch == '$'
+}
+
+// isIdentifierChar returns true if ch can be part of a JavaScript identifier
+func isIdentifierChar(ch byte) bool {
+	return isIdentifierStart(ch) || (ch >= '0' && ch <= '9')
+}
+
 func connectToMongo() tea.Msg {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -313,22 +447,27 @@ func loadCollections(client *mongo.Client, dbName string) tea.Cmd {
 	}
 }
 
-func loadDocuments(client *mongo.Client, dbName, collName string, page int) tea.Cmd {
+func loadDocuments(client *mongo.Client, dbName, collName string, page int, filter bson.M) tea.Cmd {
 	return func() tea.Msg {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 
 		coll := client.Database(dbName).Collection(collName)
 
-		// Get total count
-		totalCount, err := coll.CountDocuments(ctx, bson.M{})
+		// Use provided filter or empty filter
+		if filter == nil {
+			filter = bson.M{}
+		}
+
+		// Get total count matching filter
+		totalCount, err := coll.CountDocuments(ctx, filter)
 		if err != nil {
 			return documentsLoadedMsg{err: err}
 		}
 
 		// Fetch documents for the current page
 		skip := int64(page * docsPerPage)
-		cursor, err := coll.Find(ctx, bson.M{}, options.Find().SetSkip(skip).SetLimit(docsPerPage))
+		cursor, err := coll.Find(ctx, filter, options.Find().SetSkip(skip).SetLimit(docsPerPage))
 		if err != nil {
 			return documentsLoadedMsg{err: err}
 		}
@@ -481,6 +620,88 @@ type documentSavedMsg struct {
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
+		// Handle error modal dismissal FIRST - it takes priority over everything
+		if m.errorModal {
+			switch msg.String() {
+			case "enter", "esc", "escape", " ":
+				m.errorModal = false
+				m.errorMessage = ""
+			}
+			return m, nil
+		}
+
+		// Handle query input when focused
+		if m.focus == FocusQuery {
+			switch msg.String() {
+			case "ctrl+c":
+				return m, tea.Quit
+			case "tab":
+				m.focus = FocusDocuments
+			case "shift+tab":
+				m.focus = FocusCollections
+			case "left", "ctrl+b":
+				if m.queryCursor > 0 {
+					m.queryCursor--
+				}
+			case "right", "ctrl+f":
+				if m.queryCursor < len(m.queryText) {
+					m.queryCursor++
+				}
+			case "ctrl+a":
+				m.queryCursor = 0
+			case "ctrl+e":
+				m.queryCursor = len(m.queryText)
+			case "backspace", "ctrl+h":
+				if m.queryCursor > 0 {
+					m.queryText = m.queryText[:m.queryCursor-1] + m.queryText[m.queryCursor:]
+					m.queryCursor--
+				}
+			case "delete", "ctrl+d":
+				if m.queryCursor < len(m.queryText) {
+					m.queryText = m.queryText[:m.queryCursor] + m.queryText[m.queryCursor+1:]
+				}
+			case "ctrl+k":
+				// Kill to end of line
+				m.queryText = m.queryText[:m.queryCursor]
+			case "ctrl+u":
+				// Kill to beginning of line
+				m.queryText = m.queryText[m.queryCursor:]
+				m.queryCursor = 0
+			case "enter":
+				// Execute query
+				if m.selectedCollection != "" && m.client != nil {
+					// Convert relaxed JS-style JSON to strict JSON, then parse
+					strictJSON := relaxedJSONToStrict(m.queryText)
+					var filter bson.M
+					err := json.Unmarshal([]byte(strictJSON), &filter)
+					if err != nil {
+						m.errorModal = true
+						m.errorMessage = fmt.Sprintf("Invalid query JSON: %v", err)
+						return m, nil
+					}
+					m.queryFilter = filter
+					m.queryLoading = true
+					m.currentPage = 0
+					m.docCursor = 0
+					m.docScrollOffset = 0
+					return m, tea.Batch(
+						m.querySpinner.Tick,
+						loadDocuments(m.client, m.databases[m.dbCursor], m.selectedCollection, 0, filter),
+					)
+				}
+			default:
+				// Insert regular characters
+				if len(msg.String()) == 1 {
+					ch := msg.String()[0]
+					if ch >= 32 && ch < 127 {
+						m.queryText = m.queryText[:m.queryCursor] + string(ch) + m.queryText[m.queryCursor:]
+						m.queryCursor++
+					}
+				}
+			}
+			return m, nil
+		}
+
 		switch msg.String() {
 		case "ctrl+c", "q":
 			return m, tea.Quit
@@ -550,13 +771,23 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			case FocusDatabases:
 				m.focus = FocusCollections
 			case FocusCollections:
-				if len(m.documents) > 0 {
-					m.focus = FocusDocuments
-				} else {
-					m.focus = FocusDatabases
-				}
+				m.focus = FocusQuery
+			case FocusQuery:
+				m.focus = FocusDocuments
 			case FocusDocuments:
 				m.focus = FocusDatabases
+			}
+
+		case "shift+tab":
+			switch m.focus {
+			case FocusDatabases:
+				m.focus = FocusDocuments
+			case FocusCollections:
+				m.focus = FocusDatabases
+			case FocusQuery:
+				m.focus = FocusCollections
+			case FocusDocuments:
+				m.focus = FocusQuery
 			}
 
 		case "enter":
@@ -570,8 +801,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.docScrollOffset = 0
 					m.docCursor = 0
 					m.currentPage = 0
+					m.queryFilter = bson.M{}
+					m.queryText = "{}"
+					m.queryCursor = 1
 					m.focus = FocusDocuments
-					return m, loadDocuments(m.client, m.databases[m.dbCursor], m.selectedCollection, 0)
+					return m, loadDocuments(m.client, m.databases[m.dbCursor], m.selectedCollection, 0, m.queryFilter)
 				}
 			case FocusDocuments:
 				// Toggle expand/collapse on enter
@@ -603,7 +837,20 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.loadingDocs = true
 					m.docCursor = 0
 					m.docScrollOffset = 0
-					return m, loadDocuments(m.client, m.databases[m.dbCursor], m.selectedCollection, m.currentPage)
+					return m, loadDocuments(m.client, m.databases[m.dbCursor], m.selectedCollection, m.currentPage, m.queryFilter)
+				}
+			}
+
+		case "N":
+			// Jump to last page of documents
+			if m.focus == FocusDocuments && len(m.documents) > 0 {
+				maxPage := (int(m.totalDocs) - 1) / docsPerPage
+				if m.currentPage < maxPage {
+					m.currentPage = maxPage
+					m.loadingDocs = true
+					m.docCursor = 0
+					m.docScrollOffset = 0
+					return m, loadDocuments(m.client, m.databases[m.dbCursor], m.selectedCollection, m.currentPage, m.queryFilter)
 				}
 			}
 
@@ -614,7 +861,17 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.loadingDocs = true
 				m.docCursor = 0
 				m.docScrollOffset = 0
-				return m, loadDocuments(m.client, m.databases[m.dbCursor], m.selectedCollection, m.currentPage)
+				return m, loadDocuments(m.client, m.databases[m.dbCursor], m.selectedCollection, m.currentPage, m.queryFilter)
+			}
+
+		case "P":
+			// Jump to first page of documents
+			if m.focus == FocusDocuments && m.currentPage > 0 {
+				m.currentPage = 0
+				m.loadingDocs = true
+				m.docCursor = 0
+				m.docScrollOffset = 0
+				return m, loadDocuments(m.client, m.databases[m.dbCursor], m.selectedCollection, 0, m.queryFilter)
 			}
 
 		case "ctrl+v":
@@ -758,8 +1015,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case documentsLoadedMsg:
 		m.loadingDocs = false
+		m.queryLoading = false
 		if msg.err != nil {
-			m.err = msg.err
+			m.errorModal = true
+			m.errorMessage = fmt.Sprintf("Query error: %v", msg.err)
 			return m, nil
 		}
 		m.documents = msg.documents
@@ -771,6 +1030,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.docTree[i].Collapsed = false // Expand root level
 		}
 		m.rebuildFlattenedTree()
+
+	case spinner.TickMsg:
+		if m.queryLoading {
+			var cmd tea.Cmd
+			m.querySpinner, cmd = m.querySpinner.Update(msg)
+			return m, cmd
+		}
 		m.docCursor = 0
 		m.docScrollOffset = 0
 	}
@@ -825,11 +1091,19 @@ func (m Model) View() string {
 		rightPanelWidth = 20
 	}
 
-	// Right panel total height = 2 * left panel total height
-	rightPanelTotalHeight := leftPanelTotalHeight * 2
-	rightPanelInnerHeight := rightPanelTotalHeight - 2
-	if rightPanelInnerHeight < 3 {
-		rightPanelInnerHeight = 3
+	// Right side: Query panel (small) + Documents panel (rest)
+	// Query panel: 1 line content + 2 border = 3 total height, inner height = 1
+	queryPanelInnerHeight := 1
+	queryPanelTotalHeight := queryPanelInnerHeight + 2
+
+	// Right panels total height = 2 * left panel total height
+	rightTotalHeight := leftPanelTotalHeight * 2
+
+	// Documents panel gets remaining height (subtract 1 to align with left panels)
+	docPanelTotalHeight := rightTotalHeight - queryPanelTotalHeight - 1
+	docPanelInnerHeight := docPanelTotalHeight - 2
+	if docPanelInnerHeight < 3 {
+		docPanelInnerHeight = 3
 	}
 
 	// Build left panels
@@ -841,18 +1115,102 @@ func (m Model) View() string {
 
 	leftPanel := lipgloss.JoinVertical(lipgloss.Left, dbPanel, collPanel)
 
-	// Build right documents panel
-	docPanel := m.renderDocumentsPanel(rightPanelWidth, rightPanelInnerHeight)
+	// Build right panels
+	queryPanel := m.renderQueryPanel(rightPanelWidth, queryPanelInnerHeight)
+	docPanel := m.renderDocumentsPanel(rightPanelWidth, docPanelInnerHeight)
+	rightPanel := lipgloss.JoinVertical(lipgloss.Left, queryPanel, docPanel)
 
 	// Join left and right panels
-	mainContent := lipgloss.JoinHorizontal(lipgloss.Top, leftPanel, " ", docPanel)
+	mainContent := lipgloss.JoinHorizontal(lipgloss.Top, leftPanel, " ", rightPanel)
 
 	// Help text
 	help := lipgloss.NewStyle().
 		Foreground(lipgloss.Color("241")).
 		Render("↑/↓: navigate • ←/→/space: collapse/expand • n/p: next/prev page • e: edit • tab: switch • q: quit")
 
-	return lipgloss.JoinVertical(lipgloss.Left, mainContent, help)
+	result := lipgloss.JoinVertical(lipgloss.Left, mainContent, help)
+
+	// Overlay error modal if active
+	if m.errorModal {
+		result = m.renderErrorModal(result)
+	}
+
+	return result
+}
+
+func (m Model) renderErrorModal(background string) string {
+	// Create modal box
+	modalWidth := 50
+	if m.width-10 < modalWidth {
+		modalWidth = m.width - 10
+	}
+	if modalWidth < 20 {
+		modalWidth = 20
+	}
+
+	// Wrap error message
+	msg := m.errorMessage
+	maxMsgWidth := modalWidth - 6 // Account for padding and border
+	if len(msg) > maxMsgWidth {
+		// Simple word wrap
+		var lines []string
+		words := strings.Fields(msg)
+		line := ""
+		for _, word := range words {
+			if len(line)+len(word)+1 > maxMsgWidth {
+				if line != "" {
+					lines = append(lines, line)
+				}
+				line = word
+			} else {
+				if line != "" {
+					line += " "
+				}
+				line += word
+			}
+		}
+		if line != "" {
+			lines = append(lines, line)
+		}
+		msg = strings.Join(lines, "\n")
+	}
+
+	errorTitleStyle := lipgloss.NewStyle().
+		Bold(true).
+		Foreground(lipgloss.Color("196"))
+
+	hintStyle := lipgloss.NewStyle().
+		Foreground(lipgloss.Color("241")).
+		Italic(true)
+
+	content := lipgloss.JoinVertical(lipgloss.Left,
+		errorTitleStyle.Render("Error"),
+		"",
+		msg,
+		"",
+		hintStyle.Render("Press Enter, Esc, or Space to dismiss"),
+	)
+
+	modalStyle := lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(lipgloss.Color("196")).
+		BorderBackground(lipgloss.Color("235")).
+		Background(lipgloss.Color("235")).
+		Padding(1, 2).
+		Width(modalWidth)
+
+	modal := modalStyle.Render(content)
+
+	// Use lipgloss.Place to center the modal on screen
+	return lipgloss.Place(
+		m.width,
+		m.height,
+		lipgloss.Center,
+		lipgloss.Center,
+		modal,
+		lipgloss.WithWhitespaceChars(" "),
+		lipgloss.WithWhitespaceForeground(lipgloss.Color("236")),
+	)
 }
 
 func (m Model) renderPanel(title, rightInfo, content string, focused bool, width, height int) string {
@@ -921,6 +1279,81 @@ func (m Model) renderPanel(title, rightInfo, content string, focused bool, width
 	panel := style.
 		Width(width).
 		Height(height).
+		Render(innerContent)
+
+	return panel
+}
+
+func (m Model) renderQueryPanel(width, height int) string {
+	// Render query text with cursor
+	contentWidth := width - 2 // Account for padding
+
+	// Reserve space for spinner if loading
+	spinnerWidth := 0
+	spinnerStr := ""
+	if m.queryLoading {
+		spinnerStr = m.querySpinner.View()
+		spinnerWidth = lipgloss.Width(spinnerStr) + 1 // +1 for space
+	}
+
+	availableWidth := contentWidth - spinnerWidth
+
+	var content string
+	if m.focus == FocusQuery {
+		// Show cursor
+		before := m.queryText[:m.queryCursor]
+		after := m.queryText[m.queryCursor:]
+		cursor := lipgloss.NewStyle().Reverse(true).Render(" ")
+		if m.queryCursor < len(m.queryText) {
+			cursor = lipgloss.NewStyle().Reverse(true).Render(string(m.queryText[m.queryCursor]))
+			after = m.queryText[m.queryCursor+1:]
+		}
+		content = before + cursor + after
+	} else {
+		content = m.queryText
+	}
+
+	// Truncate if too long
+	if len(m.queryText) > availableWidth {
+		content = m.queryText[:availableWidth-3] + "..."
+	}
+
+	// Add spinner on the right if loading
+	if m.queryLoading {
+		// Pad content to push spinner to the right
+		contentLen := lipgloss.Width(content)
+		padding := availableWidth - contentLen
+		if padding > 0 {
+			content = content + strings.Repeat(" ", padding)
+		}
+		content = content + " " + spinnerStr
+	}
+
+	return m.renderQueryPanelFrame("Query", content, m.focus == FocusQuery, width, height)
+}
+
+func (m Model) renderQueryPanelFrame(title, content string, focused bool, width, height int) string {
+	style := panelStyle
+	if focused {
+		style = focusedPanelStyle
+	}
+
+	contentWidth := width - 2
+	titleRendered := titleStyle.Render(title)
+
+	// Truncate title if needed
+	if lipgloss.Width(titleRendered) > contentWidth {
+		title = title[:contentWidth-4] + "..."
+		titleRendered = titleStyle.Render(title)
+	}
+
+	// For the query panel, we just show title on one line, content directly below (no blank line)
+	// Since height is 1, we only have room for the content
+	innerContent := lipgloss.JoinVertical(lipgloss.Left, titleRendered, content)
+
+	panel := style.
+		Width(width).
+		Height(height + 1). // +1 for the title line
 		Render(innerContent)
 
 	return panel
