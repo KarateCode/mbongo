@@ -41,6 +41,13 @@ var (
 			PaddingLeft(1).
 			PaddingRight(1)
 
+	// Style for selected item when panel is not focused (dimmer)
+	selectedUnfocusedStyle = lipgloss.NewStyle().
+				Foreground(lipgloss.Color("252")).
+				Background(lipgloss.Color("236")).
+				PaddingLeft(1).
+				PaddingRight(1)
+
 	normalStyle = lipgloss.NewStyle().
 			Foreground(lipgloss.Color("252")).
 			PaddingLeft(2)
@@ -859,6 +866,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.collSearchInput.Blur()
 					m.collSearchInput.SetValue("")
 					m.updateFilteredCollections()
+					// Set cursor to the selected collection in the full list
+					for i, coll := range m.collFiltered {
+						if coll == m.selectedCollection {
+							m.collCursor = i
+							break
+						}
+					}
 					return m, loadDocuments(m.client, m.selectedDatabase, m.selectedCollection, 0, m.queryFilter)
 				}
 			default:
@@ -906,6 +920,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.dbSearchInput.Blur()
 					m.dbSearchInput.SetValue("")
 					m.updateFilteredDatabases()
+					// Set cursor to the selected database in the full list
+					for i, db := range m.dbFiltered {
+						if db == m.selectedDatabase {
+							m.dbCursor = i
+							break
+						}
+					}
 					// Navigate to Collections panel
 					m.focus = FocusCollections
 					return m, loadCollections(m.client, m.selectedDatabase)
@@ -1826,6 +1847,10 @@ func truncate(s string, maxLen int) string {
 }
 
 func (m Model) renderList(items []string, cursor int, focused bool, maxHeight int) string {
+	return m.renderListWithSelection(items, cursor, focused, maxHeight, true)
+}
+
+func (m Model) renderListWithSelection(items []string, cursor int, focused bool, maxHeight int, showUnfocusedSelection bool) string {
 	if len(items) == 0 {
 		return normalStyle.Render("(empty)")
 	}
@@ -1860,6 +1885,8 @@ func (m Model) renderList(items []string, cursor int, focused bool, maxHeight in
 		item := truncate(items[i], maxItemWidth)
 		if i == cursor && focused {
 			rendered += selectedStyle.Render(item) + "\n"
+		} else if i == cursor && showUnfocusedSelection {
+			rendered += selectedUnfocusedStyle.Render(item) + "\n"
 		} else {
 			rendered += normalStyle.Render(item) + "\n"
 		}
