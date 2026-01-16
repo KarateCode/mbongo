@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/charmbracelet/bubbles/spinner"
+	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"go.mongodb.org/mongo-driver/bson"
@@ -151,6 +152,11 @@ type Model struct {
 	// Error modal
 	errorModal   bool   // Whether to show error modal
 	errorMessage string // Error message to display
+	// Collection search
+	collSearchActive    bool            // Whether search mode is active
+	collSearchInput     textinput.Model // Search input field
+	collFiltered        []string        // Filtered collection names
+	collFilteredIndices []int           // Indices into original collections slice
 }
 
 func initialModel() Model {
@@ -158,18 +164,25 @@ func initialModel() Model {
 	s.Spinner = spinner.Dot
 	s.Style = lipgloss.NewStyle().Foreground(lipgloss.Color("205"))
 
+	ti := textinput.New()
+	ti.Placeholder = "search..."
+	ti.CharLimit = 100
+	ti.Width = leftPanelWidth - 4
+
 	return Model{
-		databases:    []string{},
-		collections:  []string{},
-		documents:    []bson.M{},
-		dbCursor:     0,
-		collCursor:   0,
-		queryText:    "{}",
-		queryCursor:  1, // Start between the braces
-		querySpinner: s,
-		queryFilter:  bson.M{},
-		focus:        FocusDatabases,
-		loading:      true,
+		databases:       []string{},
+		collections:     []string{},
+		documents:       []bson.M{},
+		dbCursor:        0,
+		collCursor:      0,
+		queryText:       "{}",
+		queryCursor:     1, // Start between the braces
+		querySpinner:    s,
+		queryFilter:     bson.M{},
+		focus:           FocusDatabases,
+		loading:         true,
+		collSearchInput: ti,
+		collFiltered:    []string{},
 	}
 }
 
@@ -405,6 +418,69 @@ func isIdentifierStart(ch byte) bool {
 // isIdentifierChar returns true if ch can be part of a JavaScript identifier
 func isIdentifierChar(ch byte) bool {
 	return isIdentifierStart(ch) || (ch >= '0' && ch <= '9')
+}
+
+// fuzzyMatch returns true if pattern fuzzy-matches target (case-insensitive)
+// Spaces in pattern separate independent sub-patterns that must all match.
+// Characters in each sub-pattern must appear in target in order, but not necessarily contiguous.
+// Example: "cus gr" matches "CustomerGroup" because "cus" and "gr" both fuzzy-match.
+func fuzzyMatch(pattern, target string) bool {
+	target = strings.ToLower(target)
+
+	// Split pattern by spaces into sub-patterns
+	subPatterns := strings.Fields(strings.ToLower(pattern))
+	if len(subPatterns) == 0 {
+		return true
+	}
+
+	// Each sub-pattern must fuzzy-match the target
+	for _, subPattern := range subPatterns {
+		if !fuzzyMatchSingle(subPattern, target) {
+			return false
+		}
+	}
+	return true
+}
+
+// fuzzyMatchSingle checks if a single pattern fuzzy-matches target
+func fuzzyMatchSingle(pattern, target string) bool {
+	pIdx := 0
+	for tIdx := 0; tIdx < len(target) && pIdx < len(pattern); tIdx++ {
+		if target[tIdx] == pattern[pIdx] {
+			pIdx++
+		}
+	}
+	return pIdx == len(pattern)
+}
+
+// updateFilteredCollections updates the filtered collections based on search input
+func (m *Model) updateFilteredCollections() {
+	query := m.collSearchInput.Value()
+	if query == "" {
+		// No filter - show all collections
+		m.collFiltered = m.collections
+		m.collFilteredIndices = make([]int, len(m.collections))
+		for i := range m.collections {
+			m.collFilteredIndices[i] = i
+		}
+	} else {
+		// Filter collections by fuzzy match
+		m.collFiltered = []string{}
+		m.collFilteredIndices = []int{}
+		for i, coll := range m.collections {
+			if fuzzyMatch(query, coll) {
+				m.collFiltered = append(m.collFiltered, coll)
+				m.collFilteredIndices = append(m.collFilteredIndices, i)
+			}
+		}
+	}
+	// Reset cursor if out of bounds
+	if m.collCursor >= len(m.collFiltered) {
+		m.collCursor = len(m.collFiltered) - 1
+	}
+	if m.collCursor < 0 {
+		m.collCursor = 0
+	}
 }
 
 func connectToMongo() tea.Msg {
@@ -702,9 +778,73 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 
+		// Handle collection search mode
+		if m.collSearchActive {
+			switch msg.String() {
+			case "ctrl+c":
+				return m, tea.Quit
+			case "esc", "ctrl+g":
+				// Cancel search
+				m.collSearchActive = false
+				m.collSearchInput.Blur()
+				m.collSearchInput.SetValue("")
+				m.updateFilteredCollections()
+			case "ctrl+n", "down":
+				// Move cursor down in filtered list
+				if m.collCursor < len(m.collFiltered)-1 {
+					m.collCursor++
+				}
+			case "ctrl+p", "up":
+				// Move cursor up in filtered list
+				if m.collCursor > 0 {
+					m.collCursor--
+				}
+			case "enter":
+				// Select the highlighted collection
+				if len(m.collFiltered) > 0 && m.client != nil && len(m.databases) > 0 {
+					m.selectedCollection = m.collFiltered[m.collCursor]
+					m.loadingDocs = true
+					m.docScrollOffset = 0
+					m.docCursor = 0
+					m.currentPage = 0
+					m.queryFilter = bson.M{}
+					m.queryText = "{}"
+					m.queryCursor = 1
+					m.focus = FocusDocuments
+					// Clear search
+					m.collSearchActive = false
+					m.collSearchInput.Blur()
+					m.collSearchInput.SetValue("")
+					m.updateFilteredCollections()
+					return m, loadDocuments(m.client, m.databases[m.dbCursor], m.selectedCollection, 0, m.queryFilter)
+				}
+			default:
+				// Pass to textinput
+				var cmd tea.Cmd
+				prevValue := m.collSearchInput.Value()
+				m.collSearchInput, cmd = m.collSearchInput.Update(msg)
+				// Reset cursor to top when search text changes
+				if m.collSearchInput.Value() != prevValue {
+					m.collCursor = 0
+				}
+				m.updateFilteredCollections()
+				return m, cmd
+			}
+			return m, nil
+		}
+
 		switch msg.String() {
 		case "ctrl+c", "q":
 			return m, tea.Quit
+
+		case "/", "ctrl+s":
+			// Activate collection search when on Collections panel
+			if m.focus == FocusCollections {
+				m.collSearchActive = true
+				m.collSearchInput.Focus()
+				m.updateFilteredCollections()
+				return m, textinput.Blink
+			}
 
 		case "up", "k", "ctrl+p":
 			switch m.focus {
@@ -736,7 +876,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					}
 				}
 			case FocusCollections:
-				if m.collCursor < len(m.collections)-1 {
+				if m.collCursor < len(m.collFiltered)-1 {
 					m.collCursor++
 				}
 			case FocusDocuments:
@@ -795,8 +935,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			case FocusDatabases:
 				m.focus = FocusCollections
 			case FocusCollections:
-				if len(m.collections) > 0 && m.client != nil && len(m.databases) > 0 {
-					m.selectedCollection = m.collections[m.collCursor]
+				if len(m.collFiltered) > 0 && m.client != nil && len(m.databases) > 0 {
+					m.selectedCollection = m.collFiltered[m.collCursor]
 					m.loadingDocs = true
 					m.docScrollOffset = 0
 					m.docCursor = 0
@@ -1006,6 +1146,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.collections = msg.collections
 		m.collCursor = 0
+		// Reset search state
+		m.collSearchActive = false
+		m.collSearchInput.SetValue("")
+		m.updateFilteredCollections()
 		// Clear documents when switching databases
 		m.documents = []bson.M{}
 		m.selectedCollection = ""
@@ -1110,8 +1254,17 @@ func (m Model) View() string {
 	dbContent := m.renderList(m.databases, m.dbCursor, m.focus == FocusDatabases, leftPanelInnerHeight-3)
 	dbPanel := m.renderPanel("Databases", "", dbContent, m.focus == FocusDatabases, leftPanelWidth, leftPanelInnerHeight)
 
-	collContent := m.renderList(m.collections, m.collCursor, m.focus == FocusCollections, leftPanelInnerHeight-3)
-	collPanel := m.renderPanel("Collections", "", collContent, m.focus == FocusCollections, leftPanelWidth, leftPanelInnerHeight)
+	// Collections panel with optional search bar
+	var collContent string
+	collListHeight := leftPanelInnerHeight - 3
+	if m.collSearchActive {
+		// Show search input at top, reduce list height
+		collListHeight -= 1
+		collContent = m.collSearchInput.View() + "\n" + m.renderList(m.collFiltered, m.collCursor, true, collListHeight)
+	} else {
+		collContent = m.renderList(m.collFiltered, m.collCursor, m.focus == FocusCollections, collListHeight)
+	}
+	collPanel := m.renderPanel("Collections", "", collContent, m.focus == FocusCollections || m.collSearchActive, leftPanelWidth, leftPanelInnerHeight)
 
 	leftPanel := lipgloss.JoinVertical(lipgloss.Left, dbPanel, collPanel)
 
@@ -1126,7 +1279,7 @@ func (m Model) View() string {
 	// Help text
 	help := lipgloss.NewStyle().
 		Foreground(lipgloss.Color("241")).
-		Render("↑/↓: navigate • ←/→/space: collapse/expand • n/p: next/prev page • e: edit • tab: switch • q: quit")
+		Render("↑/↓: navigate • /: search • ←/→/space: collapse/expand • n/p: next/prev page • e: edit • tab: switch • q: quit")
 
 	result := lipgloss.JoinVertical(lipgloss.Left, mainContent, help)
 
