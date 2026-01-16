@@ -2,8 +2,10 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
+	"os/exec"
 	"sort"
 	"strconv"
 	"strings"
@@ -123,6 +125,7 @@ type Model struct {
 	collections        []string
 	documents          []bson.M
 	totalDocs          int64
+	currentPage        int // 0-indexed page number
 	dbCursor           int
 	collCursor         int
 	focus              Focus
@@ -167,6 +170,109 @@ func (m Model) getDocPanelHeight() int {
 	return rightPanelTotalHeight - 4
 }
 
+// saveDocument saves the modified document back to MongoDB
+func (m Model) saveDocument(docIndex int, newDoc bson.M) tea.Cmd {
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+
+		// Get the original document's _id
+		originalDoc := m.documents[docIndex]
+		docID, ok := originalDoc["_id"]
+		if !ok {
+			return documentSavedMsg{err: fmt.Errorf("document has no _id field"), docIndex: docIndex}
+		}
+
+		// Ensure the new document has the original _id (MongoDB doesn't allow changing _id)
+		// Remove any _id from the edited doc and use the original
+		delete(newDoc, "_id")
+		newDoc["_id"] = docID
+
+		// Replace the document in MongoDB
+		coll := m.client.Database(m.databases[m.dbCursor]).Collection(m.selectedCollection)
+		_, err := coll.ReplaceOne(ctx, bson.M{"_id": docID}, newDoc)
+		if err != nil {
+			return documentSavedMsg{err: err, docIndex: docIndex}
+		}
+
+		return documentSavedMsg{err: nil, docIndex: docIndex, newDoc: newDoc}
+	}
+}
+
+// expandTilde expands ~ to the user's home directory
+func expandTilde(path string) string {
+	if strings.HasPrefix(path, "~/") {
+		home, err := os.UserHomeDir()
+		if err == nil {
+			return home + path[1:]
+		}
+	}
+	return path
+}
+
+// openInEditor opens the document at the given index in $EDITOR
+func (m Model) openInEditor(docIndex int) tea.Cmd {
+	doc := m.documents[docIndex]
+
+	// Convert to JSON
+	jsonBytes, err := json.MarshalIndent(doc, "", "  ")
+	if err != nil {
+		return func() tea.Msg {
+			return editorFinishedMsg{err: err, docIndex: docIndex}
+		}
+	}
+
+	// Create temp file
+	tmpFile, err := os.CreateTemp("", "mbongo-*.json")
+	if err != nil {
+		return func() tea.Msg {
+			return editorFinishedMsg{err: err, docIndex: docIndex}
+		}
+	}
+	tmpFileName := tmpFile.Name()
+
+	// Write JSON to temp file
+	if _, err := tmpFile.Write(jsonBytes); err != nil {
+		tmpFile.Close()
+		return func() tea.Msg {
+			return editorFinishedMsg{err: err, docIndex: docIndex}
+		}
+	}
+	tmpFile.Close()
+
+	// Get editor from environment
+	editorEnv := os.Getenv("EDITOR")
+	if editorEnv == "" {
+		editorEnv = "vi" // fallback
+	}
+
+	// Parse editor command - it may contain arguments (e.g., "emacs --init-directory=~/foo")
+	parts := strings.Fields(editorEnv)
+	editorCmd := parts[0]
+	var editorArgs []string
+	for _, arg := range parts[1:] {
+		editorArgs = append(editorArgs, expandTilde(arg))
+	}
+	editorArgs = append(editorArgs, tmpFileName)
+
+	// Create the editor command
+	c := exec.Command(editorCmd, editorArgs...)
+
+	// Store original JSON for comparison
+	originalJSON := make([]byte, len(jsonBytes))
+	copy(originalJSON, jsonBytes)
+
+	// Use tea.ExecProcess to hand over the terminal to the editor
+	return tea.ExecProcess(c, func(err error) tea.Msg {
+		return editorFinishedMsg{
+			err:          err,
+			tempFile:     tmpFileName,
+			originalJSON: originalJSON,
+			docIndex:     docIndex,
+		}
+	})
+}
+
 func connectToMongo() tea.Msg {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -207,7 +313,7 @@ func loadCollections(client *mongo.Client, dbName string) tea.Cmd {
 	}
 }
 
-func loadDocuments(client *mongo.Client, dbName, collName string) tea.Cmd {
+func loadDocuments(client *mongo.Client, dbName, collName string, page int) tea.Cmd {
 	return func() tea.Msg {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
@@ -220,8 +326,9 @@ func loadDocuments(client *mongo.Client, dbName, collName string) tea.Cmd {
 			return documentsLoadedMsg{err: err}
 		}
 
-		// Fetch first N documents
-		cursor, err := coll.Find(ctx, bson.M{}, options.Find().SetLimit(docsPerPage))
+		// Fetch documents for the current page
+		skip := int64(page * docsPerPage)
+		cursor, err := coll.Find(ctx, bson.M{}, options.Find().SetSkip(skip).SetLimit(docsPerPage))
 		if err != nil {
 			return documentsLoadedMsg{err: err}
 		}
@@ -329,6 +436,48 @@ func (m *Model) rebuildFlattenedTree() {
 	m.flattenedTree = flattenTree(m.docTree)
 }
 
+// getDocumentIndexAtCursor returns the index of the document the cursor is on
+func (m Model) getDocumentIndexAtCursor() int {
+	if len(m.flattenedTree) == 0 || m.docCursor >= len(m.flattenedTree) {
+		return -1
+	}
+
+	// Walk backwards from cursor to find the root node (depth 0)
+	// Count how many root nodes we pass
+	docIndex := 0
+	for i := m.docCursor; i >= 0; i-- {
+		node := m.flattenedTree[i]
+		if node.Depth == 0 && node.IsObject {
+			// This is a document root
+			// Count how many doc roots are before this position
+			docIndex = 0
+			for j := 0; j <= i; j++ {
+				n := m.flattenedTree[j]
+				if n.Depth == 0 && n.IsObject {
+					docIndex++
+				}
+			}
+			return docIndex - 1
+		}
+	}
+	return 0
+}
+
+// editorFinishedMsg is sent when the editor closes
+type editorFinishedMsg struct {
+	err          error
+	tempFile     string
+	originalJSON []byte
+	docIndex     int
+}
+
+// documentSavedMsg is sent when a document is saved to MongoDB
+type documentSavedMsg struct {
+	err      error
+	docIndex int
+	newDoc   bson.M
+}
+
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
@@ -420,8 +569,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.loadingDocs = true
 					m.docScrollOffset = 0
 					m.docCursor = 0
+					m.currentPage = 0
 					m.focus = FocusDocuments
-					return m, loadDocuments(m.client, m.databases[m.dbCursor], m.selectedCollection)
+					return m, loadDocuments(m.client, m.databases[m.dbCursor], m.selectedCollection, 0)
 				}
 			case FocusDocuments:
 				// Toggle expand/collapse on enter
@@ -432,6 +582,39 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						m.rebuildFlattenedTree()
 					}
 				}
+			}
+
+		case " ":
+			// Spacebar also toggles expand/collapse in documents panel
+			if m.focus == FocusDocuments && len(m.flattenedTree) > 0 {
+				node := m.flattenedTree[m.docCursor]
+				if node.IsObject || node.IsArray {
+					node.Collapsed = !node.Collapsed
+					m.rebuildFlattenedTree()
+				}
+			}
+
+		case "n":
+			// Next page of documents
+			if m.focus == FocusDocuments && len(m.documents) > 0 {
+				maxPage := (int(m.totalDocs) - 1) / docsPerPage
+				if m.currentPage < maxPage {
+					m.currentPage++
+					m.loadingDocs = true
+					m.docCursor = 0
+					m.docScrollOffset = 0
+					return m, loadDocuments(m.client, m.databases[m.dbCursor], m.selectedCollection, m.currentPage)
+				}
+			}
+
+		case "p":
+			// Previous page of documents
+			if m.focus == FocusDocuments && m.currentPage > 0 {
+				m.currentPage--
+				m.loadingDocs = true
+				m.docCursor = 0
+				m.docScrollOffset = 0
+				return m, loadDocuments(m.client, m.databases[m.dbCursor], m.selectedCollection, m.currentPage)
 			}
 
 		case "ctrl+v":
@@ -481,7 +664,60 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.docScrollOffset = maxOffset
 				}
 			}
+
+		case "e":
+			// Edit document in external editor
+			if m.focus == FocusDocuments && len(m.documents) > 0 {
+				docIndex := m.getDocumentIndexAtCursor()
+				if docIndex >= 0 && docIndex < len(m.documents) {
+					return m, m.openInEditor(docIndex)
+				}
+			}
 		}
+
+	case editorFinishedMsg:
+		// Clean up temp file
+		defer os.Remove(msg.tempFile)
+
+		if msg.err != nil {
+			m.err = msg.err
+			return m, nil
+		}
+
+		// Read the potentially modified file
+		newJSON, err := os.ReadFile(msg.tempFile)
+		if err != nil {
+			m.err = fmt.Errorf("failed to read edited file: %w", err)
+			return m, nil
+		}
+
+		// Check if content changed
+		if string(newJSON) == string(msg.originalJSON) {
+			// No changes, nothing to do
+			return m, nil
+		}
+
+		// Parse the new JSON
+		var newDoc bson.M
+		if err := json.Unmarshal(newJSON, &newDoc); err != nil {
+			m.err = fmt.Errorf("invalid JSON: %w", err)
+			return m, nil
+		}
+
+		// Save to MongoDB
+		return m, m.saveDocument(msg.docIndex, newDoc)
+
+	case documentSavedMsg:
+		if msg.err != nil {
+			m.err = fmt.Errorf("failed to save document: %w", msg.err)
+			return m, nil
+		}
+
+		// Update local state with the new document
+		m.documents[msg.docIndex] = msg.newDoc
+		m.docTree[msg.docIndex] = buildJSONTree(msg.newDoc, 0)
+		m.docTree[msg.docIndex].Collapsed = false
+		m.rebuildFlattenedTree()
 
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
@@ -614,7 +850,7 @@ func (m Model) View() string {
 	// Help text
 	help := lipgloss.NewStyle().
 		Foreground(lipgloss.Color("241")).
-		Render("↑/↓: navigate • ←/→: collapse/expand • enter: toggle • tab: switch panel • q: quit")
+		Render("↑/↓: navigate • ←/→/space: collapse/expand • n/p: next/prev page • e: edit • tab: switch • q: quit")
 
 	return lipgloss.JoinVertical(lipgloss.Left, mainContent, help)
 }
@@ -625,26 +861,60 @@ func (m Model) renderPanel(title, rightInfo, content string, focused bool, width
 		style = focusedPanelStyle
 	}
 
+	// Actual content width after padding (0, 1) = 2 chars for horizontal padding
+	contentWidth := width - 2
+
 	// Build header with title on left and info on right
-	titleRendered := titleStyle.Render(title)
 	var header string
 	if rightInfo != "" {
-		// Calculate spacing for right-aligned info
+		rightRendered := paginationStyle.Render(rightInfo)
+		infoWidth := lipgloss.Width(rightRendered)
+
+		// Calculate max width for title: content width - info width - minimum 1 space
+		maxTitleWidth := contentWidth - infoWidth - 1
+		if maxTitleWidth < 10 {
+			maxTitleWidth = 10
+		}
+
+		// Truncate title if needed (before styling)
+		displayTitle := title
+		if len(displayTitle) > maxTitleWidth-1 { // -1 for the padding in titleStyle
+			displayTitle = displayTitle[:maxTitleWidth-4] + "..."
+		}
+		titleRendered := titleStyle.Render(displayTitle)
 		titleWidth := lipgloss.Width(titleRendered)
-		infoWidth := lipgloss.Width(rightInfo)
-		spacing := width - titleWidth - infoWidth
+
+		spacing := contentWidth - titleWidth - infoWidth
 		if spacing < 1 {
 			spacing = 1
 		}
-		spaces := ""
-		for i := 0; i < spacing; i++ {
-			spaces += " "
-		}
-		header = titleRendered + spaces + paginationStyle.Render(rightInfo)
+		spaces := strings.Repeat(" ", spacing)
+		header = titleRendered + spaces + rightRendered
 	} else {
-		header = titleRendered
+		// No right info, just truncate title if needed
+		displayTitle := title
+		if len(displayTitle) > contentWidth-1 {
+			displayTitle = displayTitle[:contentWidth-4] + "..."
+		}
+		header = titleStyle.Render(displayTitle)
 	}
 
+	// Truncate content to fit available height
+	// Available content height = total inner height - 2 (header + blank line)
+	contentHeight := height - 2
+	if contentHeight < 0 {
+		contentHeight = 0
+	}
+	contentLines := strings.Split(content, "\n")
+	if len(contentLines) > contentHeight {
+		contentLines = contentLines[:contentHeight]
+	}
+	content = strings.Join(contentLines, "\n")
+
+	// Build the panel content with fixed structure:
+	// Line 1: header
+	// Line 2: blank
+	// Lines 3+: content
 	innerContent := lipgloss.JoinVertical(lipgloss.Left, header, "", content)
 
 	// width and height are inner dimensions (passed directly to Width/Height)
@@ -670,19 +940,24 @@ func (m Model) renderDocumentsPanel(width, height int) string {
 	} else {
 		title = fmt.Sprintf("Documents in %s", m.selectedCollection)
 
-		// Calculate pagination info
-		endDoc := int64(docsPerPage)
+		// Calculate pagination info based on current page
+		startDoc := int64(m.currentPage*docsPerPage) + 1
+		endDoc := int64((m.currentPage + 1) * docsPerPage)
 		if endDoc > m.totalDocs {
 			endDoc = m.totalDocs
 		}
-		rightInfo = fmt.Sprintf("1-%d of %d", endDoc, m.totalDocs)
+		if m.totalDocs == 0 {
+			startDoc = 0
+		}
+		rightInfo = fmt.Sprintf("%d-%d of %d", startDoc, endDoc, m.totalDocs)
 
 		if len(m.documents) == 0 {
 			content = normalStyle.Render("(no documents)")
 		} else {
-			// width is inner width, height is inner height
-			// Content area: height - 2 (title line + blank line)
-			content = m.renderDocumentTree(width, height-2)
+			// width is inner width passed to Width(), but padding(0,1) takes 2 more chars
+			// So actual content width = width - 2
+			// Content area height: height - 2 (title line + blank line)
+			content = m.renderDocumentTree(width-2, height-2)
 		}
 	}
 
@@ -718,7 +993,8 @@ func (m Model) renderDocumentTree(maxWidth, maxHeight int) string {
 		lines = append(lines, line)
 	}
 
-	return lipgloss.JoinVertical(lipgloss.Left, lines...)
+	// Join with newlines directly instead of lipgloss.JoinVertical
+	return strings.Join(lines, "\n")
 }
 
 func (m Model) renderNode(node *JSONNode, maxWidth int) string {
