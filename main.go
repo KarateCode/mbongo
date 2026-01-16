@@ -137,6 +137,7 @@ type Model struct {
 	err                error
 	loading            bool
 	loadingDocs        bool
+	selectedDatabase   string
 	selectedCollection string
 	// Document tree view
 	docTree         []*JSONNode // Root nodes (one per document)
@@ -157,6 +158,11 @@ type Model struct {
 	collSearchInput     textinput.Model // Search input field
 	collFiltered        []string        // Filtered collection names
 	collFilteredIndices []int           // Indices into original collections slice
+	// Database search
+	dbSearchActive    bool            // Whether search mode is active
+	dbSearchInput     textinput.Model // Search input field
+	dbFiltered        []string        // Filtered database names
+	dbFilteredIndices []int           // Indices into original databases slice
 }
 
 func initialModel() Model {
@@ -164,10 +170,15 @@ func initialModel() Model {
 	s.Spinner = spinner.Dot
 	s.Style = lipgloss.NewStyle().Foreground(lipgloss.Color("205"))
 
-	ti := textinput.New()
-	ti.Placeholder = "search..."
-	ti.CharLimit = 100
-	ti.Width = leftPanelWidth - 4
+	collTi := textinput.New()
+	collTi.Placeholder = "search..."
+	collTi.CharLimit = 100
+	collTi.Width = leftPanelWidth - 4
+
+	dbTi := textinput.New()
+	dbTi.Placeholder = "search..."
+	dbTi.CharLimit = 100
+	dbTi.Width = leftPanelWidth - 4
 
 	return Model{
 		databases:       []string{},
@@ -181,8 +192,10 @@ func initialModel() Model {
 		queryFilter:     bson.M{},
 		focus:           FocusDatabases,
 		loading:         true,
-		collSearchInput: ti,
+		collSearchInput: collTi,
 		collFiltered:    []string{},
+		dbSearchInput:   dbTi,
+		dbFiltered:      []string{},
 	}
 }
 
@@ -226,7 +239,7 @@ func (m Model) saveDocument(docIndex int, newDoc bson.M) tea.Cmd {
 		newDoc["_id"] = docID
 
 		// Replace the document in MongoDB
-		coll := m.client.Database(m.databases[m.dbCursor]).Collection(m.selectedCollection)
+		coll := m.client.Database(m.selectedDatabase).Collection(m.selectedCollection)
 		_, err := coll.ReplaceOne(ctx, bson.M{"_id": docID}, newDoc)
 		if err != nil {
 			return documentSavedMsg{err: err, docIndex: docIndex}
@@ -480,6 +493,36 @@ func (m *Model) updateFilteredCollections() {
 	}
 	if m.collCursor < 0 {
 		m.collCursor = 0
+	}
+}
+
+// updateFilteredDatabases updates the filtered databases based on search input
+func (m *Model) updateFilteredDatabases() {
+	query := m.dbSearchInput.Value()
+	if query == "" {
+		// No filter - show all databases
+		m.dbFiltered = m.databases
+		m.dbFilteredIndices = make([]int, len(m.databases))
+		for i := range m.databases {
+			m.dbFilteredIndices[i] = i
+		}
+	} else {
+		// Filter databases by fuzzy match
+		m.dbFiltered = []string{}
+		m.dbFilteredIndices = []int{}
+		for i, db := range m.databases {
+			if fuzzyMatch(query, db) {
+				m.dbFiltered = append(m.dbFiltered, db)
+				m.dbFilteredIndices = append(m.dbFilteredIndices, i)
+			}
+		}
+	}
+	// Reset cursor if out of bounds
+	if m.dbCursor >= len(m.dbFiltered) {
+		m.dbCursor = len(m.dbFiltered) - 1
+	}
+	if m.dbCursor < 0 {
+		m.dbCursor = 0
 	}
 }
 
@@ -762,7 +805,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.docScrollOffset = 0
 					return m, tea.Batch(
 						m.querySpinner.Tick,
-						loadDocuments(m.client, m.databases[m.dbCursor], m.selectedCollection, 0, filter),
+						loadDocuments(m.client, m.selectedDatabase, m.selectedCollection, 0, filter),
 					)
 				}
 			default:
@@ -801,7 +844,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 			case "enter":
 				// Select the highlighted collection
-				if len(m.collFiltered) > 0 && m.client != nil && len(m.databases) > 0 {
+				if len(m.collFiltered) > 0 && m.client != nil && m.selectedDatabase != "" {
 					m.selectedCollection = m.collFiltered[m.collCursor]
 					m.loadingDocs = true
 					m.docScrollOffset = 0
@@ -816,7 +859,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.collSearchInput.Blur()
 					m.collSearchInput.SetValue("")
 					m.updateFilteredCollections()
-					return m, loadDocuments(m.client, m.databases[m.dbCursor], m.selectedCollection, 0, m.queryFilter)
+					return m, loadDocuments(m.client, m.selectedDatabase, m.selectedCollection, 0, m.queryFilter)
 				}
 			default:
 				// Pass to textinput
@@ -833,12 +876,67 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 
+		// Handle database search mode
+		if m.dbSearchActive {
+			switch msg.String() {
+			case "ctrl+c":
+				return m, tea.Quit
+			case "esc", "ctrl+g":
+				// Cancel search
+				m.dbSearchActive = false
+				m.dbSearchInput.Blur()
+				m.dbSearchInput.SetValue("")
+				m.updateFilteredDatabases()
+			case "ctrl+n", "down":
+				// Move cursor down in filtered list
+				if m.dbCursor < len(m.dbFiltered)-1 {
+					m.dbCursor++
+				}
+			case "ctrl+p", "up":
+				// Move cursor up in filtered list
+				if m.dbCursor > 0 {
+					m.dbCursor--
+				}
+			case "enter":
+				// Select the highlighted database and load its collections
+				if len(m.dbFiltered) > 0 && m.client != nil {
+					m.selectedDatabase = m.dbFiltered[m.dbCursor]
+					// Clear search
+					m.dbSearchActive = false
+					m.dbSearchInput.Blur()
+					m.dbSearchInput.SetValue("")
+					m.updateFilteredDatabases()
+					// Navigate to Collections panel
+					m.focus = FocusCollections
+					return m, loadCollections(m.client, m.selectedDatabase)
+				}
+			default:
+				// Pass to textinput
+				var cmd tea.Cmd
+				prevValue := m.dbSearchInput.Value()
+				m.dbSearchInput, cmd = m.dbSearchInput.Update(msg)
+				// Reset cursor to top when search text changes
+				if m.dbSearchInput.Value() != prevValue {
+					m.dbCursor = 0
+				}
+				m.updateFilteredDatabases()
+				return m, cmd
+			}
+			return m, nil
+		}
+
 		switch msg.String() {
 		case "ctrl+c", "q":
 			return m, tea.Quit
 
 		case "/", "ctrl+s":
-			// Activate collection search when on Collections panel
+			// Activate search when on Databases or Collections panel
+			if m.focus == FocusDatabases {
+				m.dbSearchActive = true
+				m.dbSearchInput.Focus()
+				m.updateFilteredDatabases()
+				return m, textinput.Blink
+			}
 			if m.focus == FocusCollections {
 				m.collSearchActive = true
 				m.collSearchInput.Focus()
@@ -851,8 +949,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			case FocusDatabases:
 				if m.dbCursor > 0 {
 					m.dbCursor--
-					if len(m.databases) > 0 && m.client != nil {
-						return m, loadCollections(m.client, m.databases[m.dbCursor])
+					if len(m.dbFiltered) > 0 && m.client != nil {
+						m.selectedDatabase = m.dbFiltered[m.dbCursor]
+						return m, loadCollections(m.client, m.selectedDatabase)
 					}
 				}
 			case FocusCollections:
@@ -869,10 +968,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "down", "j", "ctrl+n":
 			switch m.focus {
 			case FocusDatabases:
-				if m.dbCursor < len(m.databases)-1 {
+				if m.dbCursor < len(m.dbFiltered)-1 {
 					m.dbCursor++
 					if m.client != nil {
-						return m, loadCollections(m.client, m.databases[m.dbCursor])
+						m.selectedDatabase = m.dbFiltered[m.dbCursor]
+						return m, loadCollections(m.client, m.selectedDatabase)
 					}
 				}
 			case FocusCollections:
@@ -945,7 +1045,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.queryText = "{}"
 					m.queryCursor = 1
 					m.focus = FocusDocuments
-					return m, loadDocuments(m.client, m.databases[m.dbCursor], m.selectedCollection, 0, m.queryFilter)
+					return m, loadDocuments(m.client, m.selectedDatabase, m.selectedCollection, 0, m.queryFilter)
 				}
 			case FocusDocuments:
 				// Toggle expand/collapse on enter
@@ -977,7 +1077,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.loadingDocs = true
 					m.docCursor = 0
 					m.docScrollOffset = 0
-					return m, loadDocuments(m.client, m.databases[m.dbCursor], m.selectedCollection, m.currentPage, m.queryFilter)
+					return m, loadDocuments(m.client, m.selectedDatabase, m.selectedCollection, m.currentPage, m.queryFilter)
 				}
 			}
 
@@ -990,7 +1090,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.loadingDocs = true
 					m.docCursor = 0
 					m.docScrollOffset = 0
-					return m, loadDocuments(m.client, m.databases[m.dbCursor], m.selectedCollection, m.currentPage, m.queryFilter)
+					return m, loadDocuments(m.client, m.selectedDatabase, m.selectedCollection, m.currentPage, m.queryFilter)
 				}
 			}
 
@@ -1001,7 +1101,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.loadingDocs = true
 				m.docCursor = 0
 				m.docScrollOffset = 0
-				return m, loadDocuments(m.client, m.databases[m.dbCursor], m.selectedCollection, m.currentPage, m.queryFilter)
+				return m, loadDocuments(m.client, m.selectedDatabase, m.selectedCollection, m.currentPage, m.queryFilter)
 			}
 
 		case "P":
@@ -1011,7 +1111,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.loadingDocs = true
 				m.docCursor = 0
 				m.docScrollOffset = 0
-				return m, loadDocuments(m.client, m.databases[m.dbCursor], m.selectedCollection, 0, m.queryFilter)
+				return m, loadDocuments(m.client, m.selectedDatabase, m.selectedCollection, 0, m.queryFilter)
 			}
 
 		case "ctrl+v":
@@ -1127,6 +1227,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.databases = msg.databases
+		m.updateFilteredDatabases()
 
 		// Store client for later use - reconnect to get it
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -1135,8 +1236,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.client = client
 
 		// Load collections for first database
-		if len(m.databases) > 0 {
-			return m, loadCollections(m.client, m.databases[0])
+		if len(m.dbFiltered) > 0 {
+			m.selectedDatabase = m.dbFiltered[0]
+			return m, loadCollections(m.client, m.selectedDatabase)
 		}
 
 	case collectionsLoadedMsg:
@@ -1251,8 +1353,17 @@ func (m Model) View() string {
 	}
 
 	// Build left panels
-	dbContent := m.renderList(m.databases, m.dbCursor, m.focus == FocusDatabases, leftPanelInnerHeight-3)
-	dbPanel := m.renderPanel("Databases", "", dbContent, m.focus == FocusDatabases, leftPanelWidth, leftPanelInnerHeight)
+	// Databases panel with optional search bar
+	var dbContent string
+	dbListHeight := leftPanelInnerHeight - 3
+	if m.dbSearchActive {
+		// Show search input at top, reduce list height
+		dbListHeight -= 1
+		dbContent = m.dbSearchInput.View() + "\n" + m.renderList(m.dbFiltered, m.dbCursor, true, dbListHeight)
+	} else {
+		dbContent = m.renderList(m.dbFiltered, m.dbCursor, m.focus == FocusDatabases, dbListHeight)
+	}
+	dbPanel := m.renderPanel("Databases", "", dbContent, m.focus == FocusDatabases || m.dbSearchActive, leftPanelWidth, leftPanelInnerHeight)
 
 	// Collections panel with optional search bar
 	var collContent string
