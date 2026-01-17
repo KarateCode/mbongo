@@ -464,14 +464,16 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		defer os.Remove(msg.tempFile)
 
 		if msg.err != nil {
-			m.err = msg.err
+			m.errorModal = true
+			m.errorMessage = fmt.Sprintf("Editor error: %v", msg.err)
 			return m, nil
 		}
 
 		// Read the potentially modified file
 		newJSON, err := os.ReadFile(msg.tempFile)
 		if err != nil {
-			m.err = fmt.Errorf("failed to read edited file: %w", err)
+			m.errorModal = true
+			m.errorMessage = fmt.Sprintf("Failed to read edited file: %v", err)
 			return m, nil
 		}
 
@@ -484,7 +486,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// Parse the new JSON
 		var newDoc bson.M
 		if err := json.Unmarshal(newJSON, &newDoc); err != nil {
-			m.err = fmt.Errorf("invalid JSON: %w", err)
+			m.errorModal = true
+			m.errorMessage = fmt.Sprintf("Invalid JSON: %v\n\nDocument was NOT saved.", err)
 			return m, nil
 		}
 
@@ -493,7 +496,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case documentSavedMsg:
 		if msg.err != nil {
-			m.err = fmt.Errorf("failed to save document: %w", msg.err)
+			m.errorModal = true
+			m.errorMessage = fmt.Sprintf("Failed to save document: %v\n\nDocument was NOT saved.", msg.err)
 			return m, nil
 		}
 
