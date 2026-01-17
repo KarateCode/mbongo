@@ -63,4 +63,9 @@ var (
 
 	paginationStyle = lipgloss.NewStyle().
 			Foreground(lipgloss.Color("244"))
+
+	// Style for search match highlighting in documents panel
+	docSearchMatchStyle = lipgloss.NewStyle().
+				Background(lipgloss.Color("58")).
+				Foreground(lipgloss.Color("229"))
 )

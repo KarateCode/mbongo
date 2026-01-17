@@ -196,7 +196,14 @@ func (m Model) getDocPanelHeight() int {
 	docPanelTotalHeight := rightTotalHeight - queryPanelTotalHeight
 
 	// Inner height minus borders (2), minus header + blank line (2)
-	return docPanelTotalHeight - 4
+	height := docPanelTotalHeight - 4
+
+	// Account for search bar if active
+	if m.docSearchActive {
+		height--
+	}
+
+	return height
 }
 
 // adjustScrollForCursor ensures the cursor is visible
@@ -213,6 +220,12 @@ func (m Model) renderDocumentsPanel(width, height int) string {
 	var title string
 	var rightInfo string
 	var content string
+
+	// Reserve space for search bar if active
+	searchBarHeight := 0
+	if m.docSearchActive {
+		searchBarHeight = 1
+	}
 
 	if m.selectedCollection == "" {
 		title = "Documents"
@@ -239,12 +252,45 @@ func (m Model) renderDocumentsPanel(width, height int) string {
 		} else {
 			// width is inner width passed to Width(), but padding(0,1) takes 2 more chars
 			// So actual content width = width - 2
-			// Content area height: height - 2 (title line + blank line)
-			content = m.renderDocumentTree(width-2, height-2)
+			// Content area height: height - 2 (title line + blank line) - search bar
+			treeHeight := height - 2 - searchBarHeight
+			content = m.renderDocumentTree(width-2, treeHeight)
 		}
 	}
 
+	// Append search bar if active
+	if m.docSearchActive {
+		searchBar := m.renderDocSearchBar(width - 2)
+		content = content + "\n" + searchBar
+	}
+
 	return m.renderPanel(title, rightInfo, content, m.focus == FocusDocuments, width, height)
+}
+
+// renderDocSearchBar renders the search input bar at the bottom of the documents panel
+func (m Model) renderDocSearchBar(width int) string {
+	// Build the search bar
+	inputView := m.docSearchInput.View()
+
+	// Add match count info
+	var matchInfo string
+	if m.docSearchInput.Value() != "" {
+		if len(m.docSearchMatches) == 0 {
+			matchInfo = " [no matches]"
+		} else {
+			matchInfo = fmt.Sprintf(" [%d/%d]", m.docSearchCurrent+1, len(m.docSearchMatches))
+		}
+	}
+
+	searchLine := inputView + paginationStyle.Render(matchInfo)
+
+	// Ensure it fits within width
+	if lipgloss.Width(searchLine) > width {
+		// Truncate if needed
+		return searchLine[:width]
+	}
+
+	return searchLine
 }
 
 func (m Model) renderDocumentTree(maxWidth, maxHeight int) string {
@@ -264,6 +310,12 @@ func (m Model) renderDocumentTree(maxWidth, maxHeight int) string {
 		end = len(m.flattenedTree)
 	}
 
+	// Build a set of matching line indices for quick lookup
+	matchSet := make(map[int]bool)
+	for _, idx := range m.docSearchMatches {
+		matchSet[idx] = true
+	}
+
 	for i := start; i < end; i++ {
 		node := m.flattenedTree[i]
 		line := m.renderNode(node, maxWidth)
@@ -271,6 +323,9 @@ func (m Model) renderDocumentTree(maxWidth, maxHeight int) string {
 		// Highlight cursor line
 		if i == m.docCursor && m.focus == FocusDocuments {
 			line = docCursorStyle.Render(line)
+		} else if m.docSearchActive && matchSet[i] {
+			// Highlight matching lines during search
+			line = docSearchMatchStyle.Render(line)
 		}
 
 		lines = append(lines, line)
@@ -395,4 +450,97 @@ func formatValue(value interface{}) string {
 		}
 		return jsonStringStyle.Render(fmt.Sprintf("%q", s))
 	}
+}
+
+// handleDocSearchKey handles key events when document search is active
+func (m *Model) handleDocSearchKey(msg tea.KeyMsg) (tea.Cmd, bool) {
+	switch msg.String() {
+	case "esc", "ctrl+g":
+		// Cancel search, keep focus in documents panel
+		m.docSearchActive = false
+		m.docSearchInput.SetValue("")
+		m.docSearchMatches = []int{}
+		m.docSearchCurrent = -1
+		return nil, true
+
+	case "enter", "ctrl+s":
+		// Jump to next match
+		if len(m.docSearchMatches) > 0 {
+			m.docSearchCurrent++
+			if m.docSearchCurrent >= len(m.docSearchMatches) {
+				m.docSearchCurrent = 0 // Wrap around
+			}
+			m.docCursor = m.docSearchMatches[m.docSearchCurrent]
+			m.adjustScrollForCursor()
+		}
+		return nil, true
+
+	case "ctrl+r":
+		// Jump to previous match
+		if len(m.docSearchMatches) > 0 {
+			m.docSearchCurrent--
+			if m.docSearchCurrent < 0 {
+				m.docSearchCurrent = len(m.docSearchMatches) - 1 // Wrap around
+			}
+			m.docCursor = m.docSearchMatches[m.docSearchCurrent]
+			m.adjustScrollForCursor()
+		}
+		return nil, true
+
+	default:
+		// Pass to text input
+		var cmd tea.Cmd
+		m.docSearchInput, cmd = m.docSearchInput.Update(msg)
+		// Update matches based on new search text
+		m.updateDocSearchMatches()
+		return cmd, true
+	}
+}
+
+// updateDocSearchMatches finds all matching lines in the flattened tree
+func (m *Model) updateDocSearchMatches() {
+	m.docSearchMatches = []int{}
+	m.docSearchCurrent = -1
+
+	searchText := strings.ToLower(m.docSearchInput.Value())
+	if searchText == "" {
+		return
+	}
+
+	// Search through all flattened nodes
+	for i, node := range m.flattenedTree {
+		lineText := m.getNodeSearchText(node)
+		if strings.Contains(strings.ToLower(lineText), searchText) {
+			m.docSearchMatches = append(m.docSearchMatches, i)
+		}
+	}
+
+	// If we have matches, set current to 0
+	if len(m.docSearchMatches) > 0 {
+		m.docSearchCurrent = 0
+		// Jump to first match
+		m.docCursor = m.docSearchMatches[0]
+		m.adjustScrollForCursor()
+	}
+}
+
+// getNodeSearchText returns the searchable text content of a node
+func (m Model) getNodeSearchText(node *JSONNode) string {
+	if node.Depth == -1 {
+		return "" // Separator
+	}
+
+	var parts []string
+
+	// Include the key
+	if node.Key != "" {
+		parts = append(parts, node.Key)
+	}
+
+	// Include value for leaf nodes
+	if !node.IsObject && !node.IsArray {
+		parts = append(parts, fmt.Sprintf("%v", node.Value))
+	}
+
+	return strings.Join(parts, " ")
 }

@@ -99,6 +99,13 @@ type Model struct {
 	// Delete confirmation modal
 	deleteConnModal bool // Whether the delete confirmation modal is open
 	deleteConnIndex int  // Index of connection to delete
+	// Document search
+	docSearchActive  bool            // Whether document search is active
+	docSearchInput   textinput.Model // Search input field
+	docSearchMatches []int           // Indices of matching lines in flattenedTree
+	docSearchCurrent int             // Current match index (-1 if none)
+	// Auto-select database from env var
+	autoSelectDB string // Database name to auto-select (from $DATABASE_NAME)
 }
 
 func initialModel() Model {
@@ -116,6 +123,16 @@ func initialModel() Model {
 	connStringInput.Placeholder = "mongodb://localhost:27017"
 	connStringInput.CharLimit = 200
 	connStringInput.Width = 40
+
+	// Document search input
+	docSearchInput := textinput.New()
+	docSearchInput.Placeholder = ""
+	docSearchInput.CharLimit = 100
+	docSearchInput.Width = 30
+	docSearchInput.Prompt = "Search: "
+
+	// Check for DATABASE_NAME env var for auto-selection
+	autoSelectDB := os.Getenv("DATABASE_NAME")
 
 	return Model{
 		screen:             ScreenConnections,
@@ -139,6 +156,10 @@ func initialModel() Model {
 		newConnNameInput:   nameInput,
 		newConnStringInput: connStringInput,
 		newConnFocusName:   true,
+		docSearchInput:     docSearchInput,
+		docSearchMatches:   []int{},
+		docSearchCurrent:   -1,
+		autoSelectDB:       autoSelectDB,
 	}
 }
 
@@ -212,12 +233,20 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 
+		// Handle document search mode
+		if m.docSearchActive {
+			cmd, handled := m.handleDocSearchKey(msg)
+			if handled {
+				return m, cmd
+			}
+		}
+
 		switch msg.String() {
 		case "ctrl+c", "q":
 			return m, tea.Quit
 
 		case "/", "ctrl+s":
-			// Activate search when on Databases or Collections panel
+			// Activate search when on Databases, Collections, or Documents panel
 			if m.focus == FocusDatabases {
 				m.dbSearchActive = true
 				m.dbSearchInput.Focus()
@@ -228,6 +257,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.collSearchActive = true
 				m.collSearchInput.Focus()
 				m.updateFilteredCollections()
+				return m, textinput.Blink
+			}
+			if m.focus == FocusDocuments {
+				m.docSearchActive = true
+				m.docSearchInput.SetValue("")
+				m.docSearchInput.Focus()
+				m.docSearchMatches = []int{}
+				m.docSearchCurrent = -1
 				return m, textinput.Blink
 			}
 
@@ -526,6 +563,21 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		client, _ := mongo.Connect(ctx, options.Client().ApplyURI(m.connectionString))
 		m.client = client
 
+		// Check if we should auto-select a database from DATABASE_NAME env var
+		if m.autoSelectDB != "" {
+			for i, db := range m.dbFiltered {
+				if db == m.autoSelectDB {
+					m.dbCursor = i
+					m.selectedDatabase = db
+					m.focus = FocusCollections // Shift focus to Collections panel
+					m.autoSelectDB = ""        // Clear so we don't re-trigger
+					return m, loadCollections(m.client, m.selectedDatabase)
+				}
+			}
+			// Database not found, clear autoSelectDB and fall through to default behavior
+			m.autoSelectDB = ""
+		}
+
 		// Load collections for first database
 		if len(m.dbFiltered) > 0 {
 			m.selectedDatabase = m.dbFiltered[0]
@@ -596,6 +648,15 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if !isDuplicate {
 				m.connections = append(m.connections, conn)
 			}
+		}
+
+		// If DATABASE_NAME env var is set, auto-connect using localhost
+		if m.autoSelectDB != "" && len(m.connections) > 0 {
+			// Use the first connection (localhost)
+			m.connectionString = m.connections[0].ConnectionString
+			m.screen = ScreenMain
+			m.loading = true
+			return m, connectToMongo(m.connectionString)
 		}
 	}
 
