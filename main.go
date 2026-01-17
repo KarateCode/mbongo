@@ -23,6 +23,14 @@ const (
 	docsPerPage             = 10
 )
 
+// Screen represents which screen is currently displayed
+type Screen int
+
+const (
+	ScreenConnections Screen = iota
+	ScreenMain
+)
+
 // Focus represents which panel is currently focused
 type Focus int
 
@@ -35,6 +43,12 @@ const (
 
 // Model represents the application state
 type Model struct {
+	// Screen state
+	screen           Screen
+	connections      []Connection // Available connections
+	connCursor       int          // Cursor for connections list
+	connectionString string       // Currently selected connection string
+	// MongoDB state
 	client             *mongo.Client
 	databases          []string
 	collections        []string
@@ -75,6 +89,16 @@ type Model struct {
 	dbSearchInput     textinput.Model // Search input field
 	dbFiltered        []string        // Filtered database names
 	dbFilteredIndices []int           // Indices into original databases slice
+	// New/Edit connection modal
+	newConnModal       bool            // Whether the new connection modal is open
+	newConnNameInput   textinput.Model // Name input field
+	newConnStringInput textinput.Model // Connection string input field
+	newConnFocusName   bool            // True if name field is focused, false if connection string
+	editingConnIndex   int             // Index of connection being edited, -1 if creating new
+	editingConnOldName string          // Original name of connection being edited (for DB update)
+	// Delete confirmation modal
+	deleteConnModal bool // Whether the delete confirmation modal is open
+	deleteConnIndex int  // Index of connection to delete
 }
 
 func initialModel() Model {
@@ -82,32 +106,78 @@ func initialModel() Model {
 	s.Spinner = spinner.Dot
 	s.Style = lipgloss.NewStyle().Foreground(lipgloss.Color("205"))
 
+	// New connection modal inputs
+	nameInput := textinput.New()
+	nameInput.Placeholder = "My Connection"
+	nameInput.CharLimit = 50
+	nameInput.Width = 40
+
+	connStringInput := textinput.New()
+	connStringInput.Placeholder = "mongodb://localhost:27017"
+	connStringInput.CharLimit = 200
+	connStringInput.Width = 40
+
 	return Model{
-		databases:       []string{},
-		collections:     []string{},
-		documents:       []bson.M{},
-		dbCursor:        0,
-		collCursor:      0,
-		queryText:       "{}",
-		queryCursor:     1, // Start between the braces
-		querySpinner:    s,
-		queryFilter:     bson.M{},
-		focus:           FocusDatabases,
-		loading:         true,
-		collSearchInput: newCollectionSearchInput(),
-		collFiltered:    []string{},
-		dbSearchInput:   newDatabaseSearchInput(),
-		dbFiltered:      []string{},
+		screen:             ScreenConnections,
+		connections:        defaultConnections,
+		connCursor:         0,
+		databases:          []string{},
+		collections:        []string{},
+		documents:          []bson.M{},
+		dbCursor:           0,
+		collCursor:         0,
+		queryText:          "{}",
+		queryCursor:        1, // Start between the braces
+		querySpinner:       s,
+		queryFilter:        bson.M{},
+		focus:              FocusDatabases,
+		loading:            false, // Don't start loading until connection is selected
+		collSearchInput:    newCollectionSearchInput(),
+		collFiltered:       []string{},
+		dbSearchInput:      newDatabaseSearchInput(),
+		dbFiltered:         []string{},
+		newConnNameInput:   nameInput,
+		newConnStringInput: connStringInput,
+		newConnFocusName:   true,
 	}
 }
 
+// connectionsLoadedMsg is sent when connections are loaded from the database
+type connectionsLoadedMsg struct {
+	connections []Connection
+	err         error
+}
+
 func (m Model) Init() tea.Cmd {
-	return connectToMongo
+	// Initialize DB and load connections
+	return func() tea.Msg {
+		if err := initDB(); err != nil {
+			return connectionsLoadedMsg{err: err}
+		}
+		connections, err := loadConnections()
+		if err != nil {
+			return connectionsLoadedMsg{err: err}
+		}
+		return connectionsLoadedMsg{connections: connections}
+	}
 }
 
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
+		// Handle connections screen
+		if m.screen == ScreenConnections {
+			cmd, shouldContinue := m.handleConnectionsKeyMsg(msg)
+			if !shouldContinue {
+				return m, cmd
+			}
+			// If we switched to main screen, start connecting
+			if m.screen == ScreenMain && m.loading {
+				return m, connectToMongo(m.connectionString)
+			}
+			return m, cmd
+		}
+
 		// Handle error modal dismissal FIRST - it takes priority over everything
 		if m.errorModal {
 			switch msg.String() {
@@ -449,7 +519,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// Store client for later use - reconnect to get it
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
-		client, _ := mongo.Connect(ctx, options.Client().ApplyURI(defaultConnectionString))
+		client, _ := mongo.Connect(ctx, options.Client().ApplyURI(m.connectionString))
 		m.client = client
 
 		// Load collections for first database
@@ -502,12 +572,38 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.docCursor = 0
 		m.docScrollOffset = 0
+
+	case connectionsLoadedMsg:
+		if msg.err != nil {
+			m.err = msg.err
+			return m, nil
+		}
+		// Merge saved connections with default localhost
+		m.connections = defaultConnections
+		for _, conn := range msg.connections {
+			// Don't duplicate if name matches a default
+			isDuplicate := false
+			for _, def := range defaultConnections {
+				if conn.Name == def.Name {
+					isDuplicate = true
+					break
+				}
+			}
+			if !isDuplicate {
+				m.connections = append(m.connections, conn)
+			}
+		}
 	}
 
 	return m, nil
 }
 
 func (m Model) View() string {
+	// Show connections screen first
+	if m.screen == ScreenConnections {
+		return m.renderConnectionsScreen()
+	}
+
 	if m.err != nil {
 		return fmt.Sprintf("Error: %v\n\nPress q to quit.", m.err)
 	}
@@ -797,6 +893,8 @@ func (m Model) renderListWithSelection(items []string, cursor int, focused bool,
 }
 
 func main() {
+	defer closeDB()
+
 	p := tea.NewProgram(initialModel(), tea.WithAltScreen())
 	if _, err := p.Run(); err != nil {
 		fmt.Printf("Error running program: %v\n", err)

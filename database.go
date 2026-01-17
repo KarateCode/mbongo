@@ -12,28 +12,30 @@ import (
 	"go.mongodb.org/mongo-driver/mongo/options"
 )
 
-func connectToMongo() tea.Msg {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
+func connectToMongo(connectionString string) tea.Cmd {
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
 
-	client, err := mongo.Connect(ctx, options.Client().ApplyURI(defaultConnectionString))
-	if err != nil {
-		return databasesLoadedMsg{err: err}
+		client, err := mongo.Connect(ctx, options.Client().ApplyURI(connectionString))
+		if err != nil {
+			return databasesLoadedMsg{err: err}
+		}
+
+		// Ping to verify connection
+		err = client.Ping(ctx, nil)
+		if err != nil {
+			return databasesLoadedMsg{err: err}
+		}
+
+		// List databases
+		databases, err := client.ListDatabaseNames(ctx, map[string]interface{}{})
+		if err != nil {
+			return databasesLoadedMsg{err: err}
+		}
+
+		return databasesLoadedMsg{databases: databases}
 	}
-
-	// Ping to verify connection
-	err = client.Ping(ctx, nil)
-	if err != nil {
-		return databasesLoadedMsg{err: err}
-	}
-
-	// List databases
-	databases, err := client.ListDatabaseNames(ctx, map[string]interface{}{})
-	if err != nil {
-		return databasesLoadedMsg{err: err}
-	}
-
-	return databasesLoadedMsg{databases: databases}
 }
 
 func loadCollections(client *mongo.Client, dbName string) tea.Cmd {
