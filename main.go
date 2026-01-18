@@ -47,7 +47,10 @@ type Model struct {
 	screen           Screen
 	connections      []Connection // Available connections
 	connCursor       int          // Cursor for connections list
-	connectionString string       // Currently selected connection string
+	connectionString string       // Originally selected connection string
+	activeConnString string       // Actual connection string in use (may be tunneled)
+	sshAlias         string       // SSH alias for tunneling (empty for direct)
+	sshTunnel        *SSHTunnel   // Active SSH tunnel (nil for direct)
 	// MongoDB state
 	client             *mongo.Client
 	databases          []string
@@ -65,6 +68,7 @@ type Model struct {
 	loadingDocs        bool
 	selectedDatabase   string
 	selectedCollection string
+	explicitDBSelect   bool // True if user pressed Enter to select DB (show errors)
 	// Document tree view
 	docTree         []*JSONNode // Root nodes (one per document)
 	flattenedTree   []*JSONNode // Flattened visible nodes for display
@@ -90,12 +94,13 @@ type Model struct {
 	dbFiltered        []string        // Filtered database names
 	dbFilteredIndices []int           // Indices into original databases slice
 	// New/Edit connection modal
-	newConnModal       bool            // Whether the new connection modal is open
-	newConnNameInput   textinput.Model // Name input field
-	newConnStringInput textinput.Model // Connection string input field
-	newConnFocusName   bool            // True if name field is focused, false if connection string
-	editingConnIndex   int             // Index of connection being edited, -1 if creating new
-	editingConnOldName string          // Original name of connection being edited (for DB update)
+	newConnModal         bool            // Whether the new connection modal is open
+	newConnNameInput     textinput.Model // Name input field
+	newConnSSHAliasInput textinput.Model // SSH alias input field
+	newConnStringInput   textinput.Model // Connection string input field
+	newConnFocusField    int             // 0=name, 1=ssh alias, 2=connection string
+	editingConnIndex     int             // Index of connection being edited, -1 if creating new
+	editingConnOldName   string          // Original name of connection being edited (for DB update)
 	// Delete confirmation modal
 	deleteConnModal bool // Whether the delete confirmation modal is open
 	deleteConnIndex int  // Index of connection to delete
@@ -119,6 +124,11 @@ func initialModel() Model {
 	nameInput.CharLimit = 50
 	nameInput.Width = 40
 
+	sshAliasInput := textinput.New()
+	sshAliasInput.Placeholder = "(blank for direct connection)"
+	sshAliasInput.CharLimit = 100
+	sshAliasInput.Width = 40
+
 	connStringInput := textinput.New()
 	connStringInput.Placeholder = "mongodb://localhost:27017"
 	connStringInput.CharLimit = 200
@@ -135,31 +145,32 @@ func initialModel() Model {
 	autoSelectDB := os.Getenv("DATABASE_NAME")
 
 	return Model{
-		screen:             ScreenConnections,
-		connections:        defaultConnections,
-		connCursor:         0,
-		databases:          []string{},
-		collections:        []string{},
-		documents:          []bson.M{},
-		dbCursor:           0,
-		collCursor:         0,
-		queryText:          "{}",
-		queryCursor:        1, // Start between the braces
-		querySpinner:       s,
-		queryFilter:        bson.M{},
-		focus:              FocusDatabases,
-		loading:            false, // Don't start loading until connection is selected
-		collSearchInput:    newCollectionSearchInput(),
-		collFiltered:       []string{},
-		dbSearchInput:      newDatabaseSearchInput(),
-		dbFiltered:         []string{},
-		newConnNameInput:   nameInput,
-		newConnStringInput: connStringInput,
-		newConnFocusName:   true,
-		docSearchInput:     docSearchInput,
-		docSearchMatches:   []int{},
-		docSearchCurrent:   -1,
-		autoSelectDB:       autoSelectDB,
+		screen:               ScreenConnections,
+		connections:          defaultConnections,
+		connCursor:           0,
+		databases:            []string{},
+		collections:          []string{},
+		documents:            []bson.M{},
+		dbCursor:             0,
+		collCursor:           0,
+		queryText:            "{}",
+		queryCursor:          1, // Start between the braces
+		querySpinner:         s,
+		queryFilter:          bson.M{},
+		focus:                FocusDatabases,
+		loading:              false, // Don't start loading until connection is selected
+		collSearchInput:      newCollectionSearchInput(),
+		collFiltered:         []string{},
+		dbSearchInput:        newDatabaseSearchInput(),
+		dbFiltered:           []string{},
+		newConnNameInput:     nameInput,
+		newConnSSHAliasInput: sshAliasInput,
+		newConnStringInput:   connStringInput,
+		newConnFocusField:    0,
+		docSearchInput:       docSearchInput,
+		docSearchMatches:     []int{},
+		docSearchCurrent:     -1,
+		autoSelectDB:         autoSelectDB,
 	}
 }
 
@@ -194,6 +205,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			// If we switched to main screen, start connecting
 			if m.screen == ScreenMain && m.loading {
+				// If SSH alias is set, establish tunnel first
+				if m.sshAlias != "" {
+					return m, establishSSHTunnel(m.sshAlias, m.connectionString)
+				}
+				// Direct connection - activeConnString is same as connectionString
+				m.activeConnString = m.connectionString
 				return m, connectToMongo(m.connectionString)
 			}
 			return m, cmd
@@ -243,6 +260,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		switch msg.String() {
 		case "ctrl+c", "q":
+			// Clean up SSH tunnel if active
+			if m.sshTunnel != nil {
+				m.sshTunnel.Close()
+			}
 			return m, tea.Quit
 
 		case "/", "ctrl+s":
@@ -275,6 +296,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.dbCursor--
 					if len(m.dbFiltered) > 0 && m.client != nil {
 						m.selectedDatabase = m.dbFiltered[m.dbCursor]
+						m.explicitDBSelect = false // Arrow key = silent errors
 						return m, loadCollections(m.client, m.selectedDatabase)
 					}
 				}
@@ -296,6 +318,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.dbCursor++
 					if m.client != nil {
 						m.selectedDatabase = m.dbFiltered[m.dbCursor]
+						m.explicitDBSelect = false // Arrow key = silent errors
 						return m, loadCollections(m.client, m.selectedDatabase)
 					}
 				}
@@ -357,6 +380,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "enter":
 			switch m.focus {
 			case FocusDatabases:
+				// Explicitly select database - show errors if load fails
+				if len(m.dbFiltered) > 0 && m.client != nil {
+					m.selectedDatabase = m.dbFiltered[m.dbCursor]
+					m.explicitDBSelect = true
+					m.focus = FocusCollections
+					return m, loadCollections(m.client, m.selectedDatabase)
+				}
 				m.focus = FocusCollections
 			case FocusCollections:
 				if len(m.collFiltered) > 0 && m.client != nil && m.selectedDatabase != "" {
@@ -560,7 +590,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// Store client for later use - reconnect to get it
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
-		client, _ := mongo.Connect(ctx, options.Client().ApplyURI(m.connectionString))
+		client, _ := mongo.Connect(ctx, options.Client().ApplyURI(m.activeConnString))
 		m.client = client
 
 		// Check if we should auto-select a database from DATABASE_NAME env var
@@ -578,15 +608,20 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.autoSelectDB = ""
 		}
 
-		// Load collections for first database
+		// Don't auto-load collections - user may not have access to all databases
+		// Just select the first database visually, user will press Enter to load collections
 		if len(m.dbFiltered) > 0 {
 			m.selectedDatabase = m.dbFiltered[0]
-			return m, loadCollections(m.client, m.selectedDatabase)
 		}
 
 	case collectionsLoadedMsg:
 		if msg.err != nil {
-			m.err = msg.err
+			// Only show error if user explicitly selected the database (pressed Enter)
+			// Silently swallow errors when just arrowing through the list
+			if m.explicitDBSelect {
+				m.errorModal = true
+				m.errorMessage = fmt.Sprintf("Failed to load collections: %v", msg.err)
+			}
 			return m, nil
 		}
 		m.collections = msg.collections
@@ -653,11 +688,29 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// If DATABASE_NAME env var is set, auto-connect using localhost
 		if m.autoSelectDB != "" && len(m.connections) > 0 {
 			// Use the first connection (localhost)
-			m.connectionString = m.connections[0].ConnectionString
+			conn := m.connections[0]
+			m.connectionString = conn.ConnectionString
+			m.sshAlias = conn.SSHAlias
 			m.screen = ScreenMain
 			m.loading = true
+			if m.sshAlias != "" {
+				return m, establishSSHTunnel(m.sshAlias, m.connectionString)
+			}
+			// Direct connection
+			m.activeConnString = m.connectionString
 			return m, connectToMongo(m.connectionString)
 		}
+
+	case sshTunnelEstablishedMsg:
+		if msg.err != nil {
+			m.loading = false
+			m.err = msg.err
+			return m, nil
+		}
+		// Store the tunnel and the tunneled connection string
+		m.sshTunnel = msg.tunnel
+		m.activeConnString = msg.connectionString
+		return m, connectToMongo(msg.connectionString)
 	}
 
 	return m, nil
@@ -670,10 +723,25 @@ func (m Model) View() string {
 	}
 
 	if m.err != nil {
-		return fmt.Sprintf("Error: %v\n\nPress q to quit.", m.err)
+		// Wrap long error messages for readability
+		errStr := fmt.Sprintf("%v", m.err)
+		maxWidth := m.width - 4
+		if maxWidth < 40 {
+			maxWidth = 80
+		}
+		var wrappedErr string
+		for len(errStr) > maxWidth {
+			wrappedErr += errStr[:maxWidth] + "\n"
+			errStr = errStr[maxWidth:]
+		}
+		wrappedErr += errStr
+		return fmt.Sprintf("Error:\n%s\n\nPress q to quit.", wrappedErr)
 	}
 
 	if m.loading {
+		if m.sshAlias != "" && m.sshTunnel == nil {
+			return "Establishing SSH tunnel..."
+		}
 		return "Connecting to MongoDB..."
 	}
 

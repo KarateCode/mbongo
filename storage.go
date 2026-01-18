@@ -48,12 +48,22 @@ func initDB() error {
 		return err
 	}
 
+	// Migration: Add ssh_alias column if it doesn't exist
+	_, err = db.Exec(`ALTER TABLE connections ADD COLUMN ssh_alias TEXT DEFAULT ''`)
+	if err != nil {
+		// Ignore error if column already exists
+		if err.Error() != "duplicate column name: ssh_alias" {
+			// Check if it's actually a "column already exists" error (SQLite varies)
+			// We'll just ignore alter table errors since the column may exist
+		}
+	}
+
 	return nil
 }
 
 // loadConnections loads all connections from the database
 func loadConnections() ([]Connection, error) {
-	rows, err := db.Query("SELECT name, connection_string FROM connections ORDER BY name")
+	rows, err := db.Query("SELECT name, connection_string, COALESCE(ssh_alias, '') FROM connections ORDER BY name")
 	if err != nil {
 		return nil, err
 	}
@@ -62,7 +72,7 @@ func loadConnections() ([]Connection, error) {
 	var connections []Connection
 	for rows.Next() {
 		var conn Connection
-		if err := rows.Scan(&conn.Name, &conn.ConnectionString); err != nil {
+		if err := rows.Scan(&conn.Name, &conn.ConnectionString, &conn.SSHAlias); err != nil {
 			return nil, err
 		}
 		connections = append(connections, conn)
@@ -74,8 +84,8 @@ func loadConnections() ([]Connection, error) {
 // saveConnection saves a new connection to the database
 func saveConnection(conn Connection) error {
 	_, err := db.Exec(
-		"INSERT INTO connections (name, connection_string) VALUES (?, ?)",
-		conn.Name, conn.ConnectionString,
+		"INSERT INTO connections (name, connection_string, ssh_alias) VALUES (?, ?, ?)",
+		conn.Name, conn.ConnectionString, conn.SSHAlias,
 	)
 	return err
 }
@@ -89,8 +99,8 @@ func deleteConnection(name string) error {
 // updateConnection updates an existing connection in the database
 func updateConnection(oldName string, conn Connection) error {
 	_, err := db.Exec(
-		"UPDATE connections SET name = ?, connection_string = ? WHERE name = ?",
-		conn.Name, conn.ConnectionString, oldName,
+		"UPDATE connections SET name = ?, connection_string = ?, ssh_alias = ? WHERE name = ?",
+		conn.Name, conn.ConnectionString, conn.SSHAlias, oldName,
 	)
 	return err
 }

@@ -12,6 +12,7 @@ import (
 type Connection struct {
 	Name             string
 	ConnectionString string
+	SSHAlias         string // SSH alias from ~/.ssh/config (empty for direct connection)
 }
 
 // Default connections list
@@ -73,21 +74,30 @@ func (m Model) renderConnectionsScreen() string {
 
 // renderNewConnectionModal renders the new connection modal overlay
 func (m Model) renderNewConnectionModal(background string) string {
-	modalWidth := 50
+	modalWidth := 55
 
 	// Labels
 	labelStyle := lipgloss.NewStyle().
 		Foreground(lipgloss.Color("252")).
 		MarginBottom(0)
 
+	hintStyle := lipgloss.NewStyle().
+		Foreground(lipgloss.Color("241")).
+		Italic(true)
+
 	// Input styling based on focus
 	nameLabel := labelStyle.Render("Name:")
+	sshLabel := labelStyle.Render("SSH Alias:")
 	connLabel := labelStyle.Render("Connection String:")
 
 	// Build the form
 	formContent := lipgloss.JoinVertical(lipgloss.Left,
 		nameLabel,
 		m.newConnNameInput.View(),
+		"",
+		sshLabel,
+		m.newConnSSHAliasInput.View(),
+		hintStyle.Render("(blank = direct connection)"),
 		"",
 		connLabel,
 		m.newConnStringInput.View(),
@@ -208,10 +218,12 @@ func (m *Model) handleConnectionsKey(key string) bool {
 	case "c":
 		// Open new connection modal
 		m.newConnModal = true
-		m.newConnFocusName = true
+		m.newConnFocusField = 0
 		m.newConnNameInput.SetValue("")
+		m.newConnSSHAliasInput.SetValue("")
 		m.newConnStringInput.SetValue("")
 		m.newConnNameInput.Focus()
+		m.newConnSSHAliasInput.Blur()
 		m.newConnStringInput.Blur()
 		return true
 	case "q", "ctrl+c":
@@ -227,25 +239,26 @@ func (m *Model) handleNewConnModalKey(key string) bool {
 		// Close modal without saving
 		m.newConnModal = false
 		m.newConnNameInput.Blur()
+		m.newConnSSHAliasInput.Blur()
 		m.newConnStringInput.Blur()
 		return true
-	case "tab", "shift+tab":
-		// Toggle focus between fields
-		m.newConnFocusName = !m.newConnFocusName
-		if m.newConnFocusName {
-			m.newConnNameInput.Focus()
-			m.newConnStringInput.Blur()
-		} else {
-			m.newConnNameInput.Blur()
-			m.newConnStringInput.Focus()
-		}
+	case "tab":
+		// Cycle focus forward between fields (0=name, 1=ssh, 2=conn)
+		m.newConnFocusField = (m.newConnFocusField + 1) % 3
+		m.updateConnModalFocus()
+		return true
+	case "shift+tab":
+		// Cycle focus backward between fields
+		m.newConnFocusField = (m.newConnFocusField + 2) % 3
+		m.updateConnModalFocus()
 		return true
 	case "enter":
 		// Save the connection
 		name := strings.TrimSpace(m.newConnNameInput.Value())
+		sshAlias := strings.TrimSpace(m.newConnSSHAliasInput.Value())
 		connString := strings.TrimSpace(m.newConnStringInput.Value())
 		if name != "" && connString != "" {
-			conn := Connection{Name: name, ConnectionString: connString}
+			conn := Connection{Name: name, ConnectionString: connString, SSHAlias: sshAlias}
 			// Save to database
 			if err := saveConnection(conn); err == nil {
 				// Add to list
@@ -254,6 +267,7 @@ func (m *Model) handleNewConnModalKey(key string) bool {
 			// Close modal
 			m.newConnModal = false
 			m.newConnNameInput.Blur()
+			m.newConnSSHAliasInput.Blur()
 			m.newConnStringInput.Blur()
 		}
 		return true
@@ -262,13 +276,31 @@ func (m *Model) handleNewConnModalKey(key string) bool {
 	default:
 		// Pass input to the focused text field
 		var cmd tea.Cmd
-		if m.newConnFocusName {
+		switch m.newConnFocusField {
+		case 0:
 			m.newConnNameInput, cmd = m.newConnNameInput.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(key)})
-		} else {
+		case 1:
+			m.newConnSSHAliasInput, cmd = m.newConnSSHAliasInput.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(key)})
+		case 2:
 			m.newConnStringInput, cmd = m.newConnStringInput.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(key)})
 		}
 		_ = cmd
 		return true
+	}
+}
+
+// updateConnModalFocus updates which input field is focused
+func (m *Model) updateConnModalFocus() {
+	m.newConnNameInput.Blur()
+	m.newConnSSHAliasInput.Blur()
+	m.newConnStringInput.Blur()
+	switch m.newConnFocusField {
+	case 0:
+		m.newConnNameInput.Focus()
+	case 1:
+		m.newConnSSHAliasInput.Focus()
+	case 2:
+		m.newConnStringInput.Focus()
 	}
 }
 
@@ -296,8 +328,10 @@ func (m *Model) handleConnectionsKeyMsg(msg tea.KeyMsg) (tea.Cmd, bool) {
 		return nil, true
 	case "enter":
 		if len(m.connections) > 0 {
-			// Set the selected connection string and move to main screen
-			m.connectionString = m.connections[m.connCursor].ConnectionString
+			// Set the selected connection and move to main screen
+			conn := m.connections[m.connCursor]
+			m.connectionString = conn.ConnectionString
+			m.sshAlias = conn.SSHAlias
 			m.screen = ScreenMain
 			m.loading = true
 		}
@@ -305,10 +339,12 @@ func (m *Model) handleConnectionsKeyMsg(msg tea.KeyMsg) (tea.Cmd, bool) {
 	case "c":
 		// Open new connection modal
 		m.newConnModal = true
-		m.newConnFocusName = true
+		m.newConnFocusField = 0
 		m.newConnNameInput.SetValue("")
+		m.newConnSSHAliasInput.SetValue("")
 		m.newConnStringInput.SetValue("")
 		m.newConnNameInput.Focus()
+		m.newConnSSHAliasInput.Blur()
 		m.newConnStringInput.Blur()
 		m.editingConnIndex = -1 // Creating new, not editing
 		m.editingConnOldName = ""
@@ -318,10 +354,12 @@ func (m *Model) handleConnectionsKeyMsg(msg tea.KeyMsg) (tea.Cmd, bool) {
 		if m.connCursor > 0 && m.connCursor < len(m.connections) {
 			conn := m.connections[m.connCursor]
 			m.newConnModal = true
-			m.newConnFocusName = true
+			m.newConnFocusField = 0
 			m.newConnNameInput.SetValue(conn.Name)
+			m.newConnSSHAliasInput.SetValue(conn.SSHAlias)
 			m.newConnStringInput.SetValue(conn.ConnectionString)
 			m.newConnNameInput.Focus()
+			m.newConnSSHAliasInput.Blur()
 			m.newConnStringInput.Blur()
 			m.editingConnIndex = m.connCursor
 			m.editingConnOldName = conn.Name
@@ -379,25 +417,26 @@ func (m *Model) handleNewConnModalKeyMsg(msg tea.KeyMsg) (tea.Cmd, bool) {
 		// Close modal without saving
 		m.newConnModal = false
 		m.newConnNameInput.Blur()
+		m.newConnSSHAliasInput.Blur()
 		m.newConnStringInput.Blur()
 		return nil, true
-	case "tab", "shift+tab":
-		// Toggle focus between fields
-		m.newConnFocusName = !m.newConnFocusName
-		if m.newConnFocusName {
-			m.newConnNameInput.Focus()
-			m.newConnStringInput.Blur()
-		} else {
-			m.newConnNameInput.Blur()
-			m.newConnStringInput.Focus()
-		}
+	case "tab":
+		// Cycle focus forward between fields (0=name, 1=ssh, 2=conn)
+		m.newConnFocusField = (m.newConnFocusField + 1) % 3
+		m.updateConnModalFocus()
+		return nil, true
+	case "shift+tab":
+		// Cycle focus backward between fields
+		m.newConnFocusField = (m.newConnFocusField + 2) % 3
+		m.updateConnModalFocus()
 		return nil, true
 	case "enter":
 		// Save the connection
 		name := strings.TrimSpace(m.newConnNameInput.Value())
+		sshAlias := strings.TrimSpace(m.newConnSSHAliasInput.Value())
 		connString := strings.TrimSpace(m.newConnStringInput.Value())
 		if name != "" && connString != "" {
-			conn := Connection{Name: name, ConnectionString: connString}
+			conn := Connection{Name: name, ConnectionString: connString, SSHAlias: sshAlias}
 			if m.editingConnIndex >= 0 {
 				// Update existing connection
 				if err := updateConnection(m.editingConnOldName, conn); err == nil {
@@ -412,6 +451,7 @@ func (m *Model) handleNewConnModalKeyMsg(msg tea.KeyMsg) (tea.Cmd, bool) {
 			// Close modal
 			m.newConnModal = false
 			m.newConnNameInput.Blur()
+			m.newConnSSHAliasInput.Blur()
 			m.newConnStringInput.Blur()
 		}
 		return nil, true
@@ -420,9 +460,12 @@ func (m *Model) handleNewConnModalKeyMsg(msg tea.KeyMsg) (tea.Cmd, bool) {
 	default:
 		// Pass input to the focused text field
 		var cmd tea.Cmd
-		if m.newConnFocusName {
+		switch m.newConnFocusField {
+		case 0:
 			m.newConnNameInput, cmd = m.newConnNameInput.Update(msg)
-		} else {
+		case 1:
+			m.newConnSSHAliasInput, cmd = m.newConnSSHAliasInput.Update(msg)
+		case 2:
 			m.newConnStringInput, cmd = m.newConnStringInput.Update(msg)
 		}
 		return cmd, true

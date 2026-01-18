@@ -34,3 +34,10 @@ type documentSavedMsg struct {
 	docIndex int
 	newDoc   bson.M
 }
+
+// sshTunnelEstablishedMsg is sent when an SSH tunnel is established
+type sshTunnelEstablishedMsg struct {
+	tunnel           *SSHTunnel
+	connectionString string // Modified connection string pointing to local tunnel
+	err              error
+}

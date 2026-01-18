@@ -38,6 +38,28 @@ func connectToMongo(connectionString string) tea.Cmd {
 	}
 }
 
+// establishSSHTunnel creates an SSH tunnel and returns a message with the tunnel and local connection string
+func establishSSHTunnel(sshAlias, connectionString string) tea.Cmd {
+	return func() tea.Msg {
+		// Parse the remote host:port from the connection string
+		remoteAddr := ParseMongoHostPort(connectionString)
+
+		// Create the tunnel
+		tunnel, err := NewSSHTunnel(sshAlias, remoteAddr)
+		if err != nil {
+			return sshTunnelEstablishedMsg{err: err}
+		}
+
+		// Build a new connection string that points to the local tunnel
+		localConnStr := BuildTunneledConnectionString(connectionString, tunnel.LocalAddr())
+
+		return sshTunnelEstablishedMsg{
+			tunnel:           tunnel,
+			connectionString: localConnStr,
+		}
+	}
+}
+
 func loadCollections(client *mongo.Client, dbName string) tea.Cmd {
 	return func() tea.Msg {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -127,6 +149,7 @@ func (m *Model) handleDatabaseSearchKey(msg tea.KeyMsg) (tea.Cmd, bool) {
 			}
 			// Navigate to Collections panel
 			m.focus = FocusCollections
+			m.explicitDBSelect = true // User pressed Enter, show errors
 			return loadCollections(m.client, m.selectedDatabase), true
 		}
 		return nil, true
