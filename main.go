@@ -280,6 +280,31 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			return m, tea.Quit
 
+		case "b":
+			// Go back to connections screen
+			// Clean up current connection state
+			if m.sshTunnel != nil {
+				m.sshTunnel.Close()
+				m.sshTunnel = nil
+			}
+			if m.client != nil {
+				m.client.Disconnect(nil)
+				m.client = nil
+			}
+			m.screen = ScreenConnections
+			m.databases = []string{}
+			m.collections = []string{}
+			m.documents = []bson.M{}
+			m.docTree = nil
+			m.flattenedTree = nil
+			m.selectedDatabase = ""
+			m.selectedCollection = ""
+			m.connectionString = ""
+			m.activeConnString = ""
+			m.sshAlias = ""
+			m.updateFilteredConnections()
+			return m, nil
+
 		case "/", "ctrl+s":
 			// Activate search when on Databases, Collections, or Documents panel
 			if m.focus == FocusDatabases {
