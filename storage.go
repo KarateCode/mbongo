@@ -12,11 +12,11 @@ var db *sql.DB
 
 // getDBPath returns the path to the SQLite database file
 func getDBPath() (string, error) {
-	configDir, err := os.UserConfigDir()
+	homeDir, err := os.UserHomeDir()
 	if err != nil {
 		return "", err
 	}
-	mbongoDir := filepath.Join(configDir, "mbongo")
+	mbongoDir := filepath.Join(homeDir, ".config", "mbongo")
 	if err := os.MkdirAll(mbongoDir, 0755); err != nil {
 		return "", err
 	}
