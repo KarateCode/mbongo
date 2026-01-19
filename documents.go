@@ -316,15 +316,25 @@ func (m Model) renderDocumentTree(maxWidth, maxHeight int) string {
 		matchSet[idx] = true
 	}
 
+	// Get the current match index if valid
+	currentMatchIdx := -1
+	if m.docSearchCurrent >= 0 && m.docSearchCurrent < len(m.docSearchMatches) {
+		currentMatchIdx = m.docSearchMatches[m.docSearchCurrent]
+	}
+
 	for i := start; i < end; i++ {
 		node := m.flattenedTree[i]
 		line := m.renderNode(node, maxWidth)
 
-		// Highlight cursor line
-		if i == m.docCursor && m.focus == FocusDocuments {
+		// Determine highlight style
+		if m.docSearchActive && i == currentMatchIdx {
+			// Current search match takes priority (bright orange)
+			line = docSearchCurrentMatchStyle.Render(line)
+		} else if i == m.docCursor && m.focus == FocusDocuments {
+			// Cursor line (gray)
 			line = docCursorStyle.Render(line)
 		} else if m.docSearchActive && matchSet[i] {
-			// Highlight matching lines during search
+			// Other matching lines during search (olive)
 			line = docSearchMatchStyle.Render(line)
 		}
 

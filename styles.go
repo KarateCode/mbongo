@@ -68,4 +68,10 @@ var (
 	docSearchMatchStyle = lipgloss.NewStyle().
 				Background(lipgloss.Color("58")).
 				Foreground(lipgloss.Color("229"))
+
+	// Style for the currently selected search match (bright orange)
+	docSearchCurrentMatchStyle = lipgloss.NewStyle().
+					Background(lipgloss.Color("208")).
+					Foreground(lipgloss.Color("0")).
+					Bold(true)
 )
