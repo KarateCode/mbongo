@@ -32,9 +32,21 @@ func (m Model) renderConnectionsScreen() string {
 		MarginBottom(1).
 		Render("Select a Connection")
 
+	// Determine which list to render
+	displayList := m.connFiltered
+	if len(displayList) == 0 && !m.connSearchActive {
+		displayList = m.connFiltered
+	}
+
 	// Render connection list
 	var listContent string
-	for i, conn := range m.connections {
+
+	// Show search input if active
+	if m.connSearchActive {
+		listContent += m.connSearchInput.View() + "\n\n"
+	}
+
+	for i, conn := range displayList {
 		item := conn.Name
 		if i == m.connCursor {
 			listContent += selectedStyle.Render(item) + "\n"
@@ -43,11 +55,19 @@ func (m Model) renderConnectionsScreen() string {
 		}
 	}
 
+	if len(displayList) == 0 {
+		listContent += normalStyle.Render("(no matches)") + "\n"
+	}
+
 	// Help text
+	helpText := "↑/↓: navigate • /: search • enter: connect • c: new • e: edit • d: delete • q: quit"
+	if m.connSearchActive {
+		helpText = "↑/↓: navigate • enter: select • esc: cancel search"
+	}
 	help := lipgloss.NewStyle().
 		Foreground(lipgloss.Color("241")).
 		MarginTop(1).
-		Render("↑/↓: navigate • enter: connect • c: new • e: edit • d: delete • q: quit")
+		Render(helpText)
 
 	// Center everything
 	content := lipgloss.JoinVertical(lipgloss.Left, title, "", listContent, help)
@@ -304,6 +324,90 @@ func (m *Model) updateConnModalFocus() {
 	}
 }
 
+// updateFilteredConnections updates the filtered connections based on search input
+func (m *Model) updateFilteredConnections() {
+	query := m.connSearchInput.Value()
+	if query == "" {
+		// No filter - show all connections
+		m.connFiltered = m.connections
+		m.connFilteredIndices = make([]int, len(m.connections))
+		for i := range m.connections {
+			m.connFilteredIndices[i] = i
+		}
+	} else {
+		// Filter connections by fuzzy match on name
+		m.connFiltered = []Connection{}
+		m.connFilteredIndices = []int{}
+		for i, conn := range m.connections {
+			if fuzzyMatch(query, conn.Name) {
+				m.connFiltered = append(m.connFiltered, conn)
+				m.connFilteredIndices = append(m.connFilteredIndices, i)
+			}
+		}
+	}
+	// Reset cursor if out of bounds
+	if m.connCursor >= len(m.connFiltered) {
+		m.connCursor = len(m.connFiltered) - 1
+	}
+	if m.connCursor < 0 {
+		m.connCursor = 0
+	}
+}
+
+// handleConnSearchKeyMsg handles keyboard input when connection search is active
+func (m *Model) handleConnSearchKeyMsg(msg tea.KeyMsg) (tea.Cmd, bool) {
+	switch msg.String() {
+	case "ctrl+c":
+		return tea.Quit, false
+	case "esc", "ctrl+g":
+		// Cancel search
+		m.connSearchActive = false
+		m.connSearchInput.Blur()
+		m.connSearchInput.SetValue("")
+		m.updateFilteredConnections()
+		return nil, true
+	case "ctrl+n", "down":
+		// Move cursor down in filtered list
+		if m.connCursor < len(m.connFiltered)-1 {
+			m.connCursor++
+		}
+		return nil, true
+	case "ctrl+p", "up":
+		// Move cursor up in filtered list
+		if m.connCursor > 0 {
+			m.connCursor--
+		}
+		return nil, true
+	case "enter":
+		// Select the highlighted connection
+		if len(m.connFiltered) > 0 {
+			conn := m.connFiltered[m.connCursor]
+			// Clear search
+			m.connSearchActive = false
+			m.connSearchInput.Blur()
+			m.connSearchInput.SetValue("")
+			m.updateFilteredConnections()
+			// Connect
+			m.connectionString = conn.ConnectionString
+			m.sshAlias = conn.SSHAlias
+			m.screen = ScreenMain
+			m.loading = true
+		}
+		return nil, true
+	default:
+		// Pass to textinput
+		var cmd tea.Cmd
+		prevValue := m.connSearchInput.Value()
+		m.connSearchInput, cmd = m.connSearchInput.Update(msg)
+		// Reset cursor to top when search text changes
+		if m.connSearchInput.Value() != prevValue {
+			m.connCursor = 0
+		}
+		m.updateFilteredConnections()
+		return cmd, true
+	}
+}
+
 // We need to update handleConnectionsKey to also handle textinput updates properly
 // This requires passing the full tea.KeyMsg instead of just the string
 func (m *Model) handleConnectionsKeyMsg(msg tea.KeyMsg) (tea.Cmd, bool) {
@@ -314,22 +418,33 @@ func (m *Model) handleConnectionsKeyMsg(msg tea.KeyMsg) (tea.Cmd, bool) {
 	if m.deleteConnModal {
 		return m.handleDeleteConnModalKeyMsg(msg)
 	}
+	// Handle search mode
+	if m.connSearchActive {
+		return m.handleConnSearchKeyMsg(msg)
+	}
 
 	switch msg.String() {
+	case "/", "ctrl+s":
+		// Activate search
+		m.connSearchActive = true
+		m.connSearchInput.SetValue("")
+		m.connSearchInput.Focus()
+		m.updateFilteredConnections()
+		return textinput.Blink, true
 	case "up", "k", "ctrl+p":
 		if m.connCursor > 0 {
 			m.connCursor--
 		}
 		return nil, true
 	case "down", "j", "ctrl+n":
-		if m.connCursor < len(m.connections)-1 {
+		if m.connCursor < len(m.connFiltered)-1 {
 			m.connCursor++
 		}
 		return nil, true
 	case "enter":
-		if len(m.connections) > 0 {
+		if len(m.connFiltered) > 0 {
 			// Set the selected connection and move to main screen
-			conn := m.connections[m.connCursor]
+			conn := m.connFiltered[m.connCursor]
 			m.connectionString = conn.ConnectionString
 			m.sshAlias = conn.SSHAlias
 			m.screen = ScreenMain
@@ -351,8 +466,10 @@ func (m *Model) handleConnectionsKeyMsg(msg tea.KeyMsg) (tea.Cmd, bool) {
 		return textinput.Blink, true
 	case "e":
 		// Edit selected connection (but not the first one - localhost)
-		if m.connCursor > 0 && m.connCursor < len(m.connections) {
-			conn := m.connections[m.connCursor]
+		if m.connCursor > 0 && m.connCursor < len(m.connFiltered) {
+			conn := m.connFiltered[m.connCursor]
+			// Find the actual index in the full list
+			actualIndex := m.connFilteredIndices[m.connCursor]
 			m.newConnModal = true
 			m.newConnFocusField = 0
 			m.newConnNameInput.SetValue(conn.Name)
@@ -361,16 +478,20 @@ func (m *Model) handleConnectionsKeyMsg(msg tea.KeyMsg) (tea.Cmd, bool) {
 			m.newConnNameInput.Focus()
 			m.newConnSSHAliasInput.Blur()
 			m.newConnStringInput.Blur()
-			m.editingConnIndex = m.connCursor
+			m.editingConnIndex = actualIndex
 			m.editingConnOldName = conn.Name
 			return textinput.Blink, true
 		}
 		return nil, true
 	case "d":
 		// Delete selected connection (but not the first one - localhost)
-		if m.connCursor > 0 && m.connCursor < len(m.connections) {
-			m.deleteConnModal = true
-			m.deleteConnIndex = m.connCursor
+		if m.connCursor > 0 && m.connCursor < len(m.connFiltered) {
+			// Find the actual index in the full list
+			actualIndex := m.connFilteredIndices[m.connCursor]
+			if actualIndex > 0 {
+				m.deleteConnModal = true
+				m.deleteConnIndex = actualIndex
+			}
 		}
 		return nil, true
 	case "q", "ctrl+c":

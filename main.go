@@ -104,6 +104,11 @@ type Model struct {
 	// Delete confirmation modal
 	deleteConnModal bool // Whether the delete confirmation modal is open
 	deleteConnIndex int  // Index of connection to delete
+	// Connection search
+	connSearchActive    bool            // Whether search mode is active
+	connSearchInput     textinput.Model // Search input field
+	connFiltered        []Connection    // Filtered connections
+	connFilteredIndices []int           // Indices into original connections slice
 	// Document search
 	docSearchActive  bool            // Whether document search is active
 	docSearchInput   textinput.Model // Search input field
@@ -141,6 +146,12 @@ func initialModel() Model {
 	docSearchInput.Width = 30
 	docSearchInput.Prompt = "Search: "
 
+	// Connection search input
+	connSearchInput := textinput.New()
+	connSearchInput.Placeholder = "search..."
+	connSearchInput.CharLimit = 100
+	connSearchInput.Width = 30
+
 	// Check for DATABASE_NAME env var for auto-selection
 	autoSelectDB := os.Getenv("DATABASE_NAME")
 
@@ -167,6 +178,9 @@ func initialModel() Model {
 		newConnSSHAliasInput: sshAliasInput,
 		newConnStringInput:   connStringInput,
 		newConnFocusField:    0,
+		connSearchInput:      connSearchInput,
+		connFiltered:         []Connection{},
+		connFilteredIndices:  []int{},
 		docSearchInput:       docSearchInput,
 		docSearchMatches:     []int{},
 		docSearchCurrent:     -1,
@@ -684,6 +698,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.connections = append(m.connections, conn)
 			}
 		}
+		// Initialize filtered connections
+		m.updateFilteredConnections()
 
 		// If DATABASE_NAME env var is set, auto-connect using localhost
 		if m.autoSelectDB != "" && len(m.connections) > 0 {
